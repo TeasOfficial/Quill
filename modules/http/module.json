@@ -1,0 +1,6 @@
+{
+    "name": "http",
+    "description": "HTTP 请求模块，支持 GET / POST",
+    "version": "1.0.0",
+    "author": "Quill"
+}
