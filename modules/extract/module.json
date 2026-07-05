@@ -1,0 +1,6 @@
+{
+    "name": "extract",
+    "description": "压缩包解压模块，支持 zip / tar / gz / bz2",
+    "version": "1.0.0",
+    "author": "Quill"
+}

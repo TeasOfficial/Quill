@@ -1,0 +1,6 @@
+{
+    "name": "download",
+    "description": "多线程文件下载模块，支持断点续传",
+    "version": "1.0.0",
+    "author": "Quill"
+}
