@@ -11,6 +11,7 @@ import (
 	"quill/internal/config"
 	"quill/internal/docserver"
 	"quill/internal/logc"
+	"quill/internal/module"
 	"quill/internal/onebot"
 	"quill/internal/plugin"
 	"quill/internal/storage"
@@ -18,6 +19,8 @@ import (
 
 func main() {
 	cfg := config.Load()
+
+	module.SetInsecureTLS(cfg.HTTPInsecure)
 
 	fmt.Println()
 	fmt.Println(logc.Cyan(`  ___  _   _ ___ _    _    `))
@@ -44,6 +47,8 @@ func main() {
 	if err := mgr.LoadPlugins("plugins"); err != nil {
 		logc.Fmt("!", logc.Yellow, "\u63d2\u4ef6\u52a0\u8f7d\u8b66\u544a: %v", err)
 	}
+
+	mgr.Start()
 
 	receiver := onebot.NewReceiver()
 	receiver.OnEvent = func(e *onebot.Event) {
@@ -122,10 +127,11 @@ func main() {
 }
 
 func trunc(s string, max int) string {
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max-1] + "\u2026"
+	return string(r[:max-1]) + "\u2026"
 }
 
 func logNotice(e *onebot.Event) {
@@ -142,9 +148,9 @@ func logNotice(e *onebot.Event) {
 		}
 	case "group_admin":
 		if e.SubType == "set" {
-			logc.Fmt("\u2606", logc.Cyan, "\u7FA1\u7BA1\u54E1  [%d] \u6210\u4E3A\u7BA1\u7406\u5458", e.UserID)
+			logc.Fmt("\u2606", logc.Cyan, "\u7BA1\u7406\u5458  [%d] \u6210\u4E3A\u7BA1\u7406\u5458", e.UserID)
 		} else {
-			logc.Fmt("\u2606", logc.Gray, "\u7FA1\u7BA1\u54E1  [%d] \u53D6\u6D88\u7BA1\u7406\u5458", e.UserID)
+			logc.Fmt("\u2606", logc.Gray, "\u7BA1\u7406\u5458  [%d] \u53D6\u6D88\u7BA1\u7406\u5458", e.UserID)
 		}
 	case "group_recall":
 		logc.Fmt("\u21B6", logc.Gray, "\u64A4\u56DE  [%d] \u64A4\u56DE\u4E86\u4E00\u6761\u6D88\u606F", e.UserID)

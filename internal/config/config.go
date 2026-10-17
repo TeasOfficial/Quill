@@ -10,30 +10,35 @@ import (
 )
 
 type Config struct {
-	BaseURL    string
-	WSURL      string
-	Token      string
-	WSMode     string
-	WSListen   string
-	WSPath     string
-	FileUnsafe bool
+	BaseURL      string
+	WSURL        string
+	Token        string
+	WSMode       string
+	WSListen     string
+	WSPath       string
+	FileUnsafe   bool
+	HTTPInsecure bool
 }
 
 func Load() *Config {
 	loadDotEnv()
 
 	cfg := &Config{
-		BaseURL:    getEnv("ONEBOT_BASE_URL", "http://localhost:3007"),
-		Token:      getEnv("ONEBOT_TOKEN", ""),
-		WSMode:     getEnv("ONEBOT_WS_MODE", "forward"),
-		WSListen:   getEnv("ONEBOT_WS_LISTEN", ":3001"),
-		WSPath:     getEnv("ONEBOT_WS_PATH", "/"),
-		FileUnsafe: getEnvBool("ONEBOT_FILE_UNSAFE"),
+		BaseURL:      getEnv("ONEBOT_BASE_URL", "http://localhost:3007"),
+		Token:        getEnv("ONEBOT_TOKEN", ""),
+		WSMode:       getEnv("ONEBOT_WS_MODE", "forward"),
+		WSListen:     getEnv("ONEBOT_WS_LISTEN", ":3001"),
+		WSPath:       getEnv("ONEBOT_WS_PATH", "/"),
+		FileUnsafe:   getEnvBool("ONEBOT_FILE_UNSAFE"),
+		HTTPInsecure: getEnvBool("ONEBOT_HTTP_INSECURE"),
 	}
 	cfg.WSURL = getEnv("ONEBOT_WS_URL", cfg.BaseURL)
 
 	if cfg.FileUnsafe {
 		logc.Fmt("\u26A0", logc.Red, "\u9AD8\u5371! ONEBOT_FILE_UNSAFE=true \u2014 bot.file \u53EF\u8BFB\u5199\u4EFB\u610F\u8DEF\u5F84")
+	}
+	if cfg.HTTPInsecure {
+		logc.Fmt("\u26A0", logc.Red, "\u9AD8\u5371! ONEBOT_HTTP_INSECURE=true \u2014 \u5185\u7F6E HTTP \u4E0D\u518D\u6821\u9A8C TLS \u8BC1\u4E66")
 	}
 
 	return cfg

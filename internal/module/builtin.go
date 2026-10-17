@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"compress/bzip2"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -19,7 +20,30 @@ import (
 	lua "github.com/yuin/gopher-lua"
 )
 
-const defaultHTTPTimeout = 15 * time.Minute
+const defaultHTTPTimeout = 60 * time.Second
+
+// httpInsecure 由配置项 ONEBOT_HTTP_INSECURE 控制，默认校验证书。
+var httpInsecure bool
+
+// SetInsecureTLS 关闭内置 HTTP 客户端的证书校验（高危，仅用于自签证书环境）。
+func SetInsecureTLS(v bool) { httpInsecure = v }
+
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: httpInsecure},
+		},
+	}
+}
+
+// luaContext 取出当前 Lua 调用携带的上下文（事件分发有 5 秒超时）。
+func luaContext(L *lua.LState) context.Context {
+	if ctx := L.Context(); ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
 
 type dlTask struct {
 	ID         string
@@ -65,7 +89,15 @@ func (t *dlTask) setError(err string) {
 func (t *dlTask) markDone() {
 	t.mu.Lock()
 	t.Done = true
-	t.TotalSize = t.Downloaded
+	if t.TotalSize <= 0 {
+		t.TotalSize = t.Downloaded
+	}
+	t.mu.Unlock()
+}
+
+func (t *dlTask) setTotal(n int64) {
+	t.mu.Lock()
+	t.TotalSize = n
 	t.mu.Unlock()
 }
 
@@ -96,14 +128,14 @@ func RegisterModuleUtil(L *lua.LState, utilTbl *lua.LTable) {
 
 func builtinHTTPGet(L *lua.LState) int {
 	url := L.CheckString(1)
-	resp := doHTTPRequest("GET", url, nil, "", defaultHTTPTimeout)
+	resp := doHTTPRequest(luaContext(L), "GET", url, nil, "", defaultHTTPTimeout)
 	L.Push(lua.LString(resp))
 	return 1
 }
 
 func builtinHTTPPost(L *lua.LState) int {
 	url := L.CheckString(1)
-	resp := doHTTPRequest("POST", url, nil, "", defaultHTTPTimeout)
+	resp := doHTTPRequest(luaContext(L), "POST", url, nil, "", defaultHTTPTimeout)
 	L.Push(lua.LString(resp))
 	return 1
 }
@@ -129,7 +161,7 @@ func builtinHTTPRequest(L *lua.LState) int {
 	if t <= 0 {
 		t = defaultHTTPTimeout
 	}
-	resp := doHTTPRequest(req.Method, req.URL, req.Headers, req.Body, t)
+	resp := doHTTPRequest(luaContext(L), req.Method, req.URL, req.Headers, req.Body, t)
 	L.Push(lua.LString(resp))
 	return 1
 }
@@ -154,7 +186,9 @@ func builtinDownloadFile(L *lua.LState) int {
 		if err != nil {
 			task.setError(err.Error())
 		} else {
-			task.TotalSize = size
+			if size > 0 {
+				task.setTotal(size)
+			}
 			task.markDone()
 		}
 	}()
@@ -291,20 +325,15 @@ type httpResponse struct {
 	Error   string            `json:"error,omitempty"`
 }
 
-func doHTTPRequest(method, url string, headers map[string]string, body string, timeout time.Duration) string {
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+func doHTTPRequest(ctx context.Context, method, url string, headers map[string]string, body string, timeout time.Duration) string {
+	client := newHTTPClient(timeout)
 
 	var bodyReader io.Reader
 	if body != "" {
 		bodyReader = strings.NewReader(body)
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return marshalResp(httpResponse{OK: false, Error: err.Error()})
 	}
@@ -345,12 +374,7 @@ func marshalResp(r httpResponse) string {
 }
 
 func downloadFile(url, path string, threads int, task *dlTask) (int64, error) {
-	client := &http.Client{
-		Timeout: defaultHTTPTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := newHTTPClient(defaultHTTPTimeout)
 
 	headReq, _ := http.NewRequest("HEAD", url, nil)
 	headReq.Header.Set("User-Agent", "Quill/1.0")
@@ -373,16 +397,11 @@ func downloadFile(url, path string, threads int, task *dlTask) (int64, error) {
 		return streamDownload(url, path, task)
 	}
 
-	return multiDownload(url, path, contentLength, threads)
+	return multiDownload(url, path, contentLength, threads, task)
 }
 
 func streamDownload(url, path string, task *dlTask) (int64, error) {
-	client := &http.Client{
-		Timeout: defaultHTTPTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := newHTTPClient(defaultHTTPTimeout)
 
 	resp, err := client.Get(url)
 	if err != nil {
@@ -411,13 +430,8 @@ func streamDownload(url, path string, task *dlTask) (int64, error) {
 	return n, err
 }
 
-func multiDownload(url, path string, total int64, threads int) (int64, error) {
-	client := &http.Client{
-		Timeout: defaultHTTPTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+func multiDownload(url, path string, total int64, threads int, task *dlTask) (int64, error) {
+	client := newHTTPClient(defaultHTTPTimeout)
 
 	chunkSize := total / int64(threads)
 	var wg sync.WaitGroup
@@ -453,7 +467,7 @@ func multiDownload(url, path string, total int64, threads int) (int64, error) {
 		}
 		defer f.Close()
 
-		_, errs[i] = io.Copy(f, resp.Body)
+		_, errs[i] = io.Copy(f, &progressReader{reader: resp.Body, task: task})
 	}
 
 	for i := 0; i < threads; i++ {

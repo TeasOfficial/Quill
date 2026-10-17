@@ -2,210 +2,581 @@ package docserver
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"embed"
+	"encoding/json"
 	"fmt"
+	"html"
 	"html/template"
 	"net/http"
+	"path"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"quill/internal/logc"
 
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/parser"
+	"github.com/yuin/goldmark/renderer"
+	ghhtml "github.com/yuin/goldmark/renderer/html"
+	"github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/util"
 )
 
 //go:embed docs/**
 var DocsFS embed.FS
 
-var md = goldmark.New(
-	goldmark.WithExtensions(extension.Table),
+//go:embed static/*
+var StaticFS embed.FS
+
+var (
+	assetVersionOnce sync.Once
+	assetVersionVal  string
 )
 
-type Page struct {
-	Title    string
-	Content  template.HTML
-	Sections []NavSection
+// assetVersion 由静态资源的哈希决定：升级 exe 后 URL 自动变化，
+// 浏览器不会继续使用旧的 CSS/JS。
+func assetVersion() string {
+	assetVersionOnce.Do(func() {
+		h := sha256.New()
+		for _, name := range []string{"wiki.css", "wiki.js"} {
+			if b, err := StaticFS.ReadFile("static/" + name); err == nil {
+				_, _ = h.Write(b)
+			}
+		}
+		assetVersionVal = fmt.Sprintf("%x", h.Sum(nil))[:10]
+	})
+	return assetVersionVal
 }
 
-type NavSection struct {
-	Name  string
-	Title string
-	Pages []NavLink
+type tocEntry struct {
+	Level int
+	Text  string
+	ID    string
 }
 
-type NavLink struct {
+type docPage struct {
+	Path    string
+	Section string
+	Title   string
+	Mode    string
+	HTML    template.HTML
+	TOC     []tocEntry
+	Plain   string
+}
+
+type navLink struct {
 	Title string
 	Href  string
+	Path  string
 }
 
-var sectionNames = map[string]string{
-	"basic": "普通版",
-	"pro":   "专业版",
+type navSection struct {
+	Title string
+	Mode  string
+	Pages []navLink
 }
 
-func titleOf(section string) string {
-	if t, ok := sectionNames[section]; ok {
-		return t
-	}
-	return section
+type site struct {
+	pages    map[string]*docPage
+	sections []navSection
+	index    []byte
 }
 
-func Serve(addr string) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", servePage)
-	server := &http.Server{Addr: addr, Handler: mux}
-	logc.Fmt("\u2637", logc.Gray, "Wiki: http://localhost%s", addr)
-	return server.ListenAndServe()
+var (
+	siteOnce sync.Once
+	siteVal  *site
+	siteErr  error
+)
+
+// sectionDefs 同时决定导航分组与页内排序；
+// 未列出的文档会按文件名排序追加到对应分组末尾。
+var sectionDefs = []struct {
+	Key   string
+	Title string
+	Order []string
+}{
+	{"basic", "普通版", []string{"quickstart", "plugin", "message", "storage", "bot_api", "util_api"}},
+	{"pro", "专业版", []string{"overview", "onebot", "message", "plugin", "storage"}},
 }
 
-func servePage(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	if path == "/" {
-		path = "/index"
-	}
-	path = strings.TrimPrefix(path, "/")
+func getSite() (*site, error) {
+	siteOnce.Do(func() {
+		siteVal, siteErr = buildSite()
+	})
+	return siteVal, siteErr
+}
 
-	sections := listSections()
+func buildSite() (*site, error) {
+	md := newMarkdown()
+	s := &site{pages: make(map[string]*docPage)}
 
-	content, err := DocsFS.ReadFile("docs/" + path + ".md")
+	homeSrc, err := DocsFS.ReadFile("docs/index.md")
 	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, "Page not found: %s", path)
-		return
+		return nil, fmt.Errorf("读取首页: %w", err)
+	}
+	home, err := renderDoc(md, "index", "", homeSrc)
+	if err != nil {
+		return nil, fmt.Errorf("渲染首页: %w", err)
+	}
+	home.Mode = "basic"
+	s.pages["index"] = home
+
+	for _, def := range sectionDefs {
+		names, err := listDocs(def.Key)
+		if err != nil {
+			return nil, err
+		}
+		ns := navSection{Title: def.Title, Mode: def.Key}
+		for _, name := range orderDocs(names, def.Order) {
+			key := def.Key + "/" + name
+			src, err := DocsFS.ReadFile("docs/" + key + ".md")
+			if err != nil {
+				return nil, fmt.Errorf("读取 %s: %w", key, err)
+			}
+			p, err := renderDoc(md, key, def.Key, src)
+			if err != nil {
+				return nil, fmt.Errorf("渲染 %s: %w", key, err)
+			}
+			p.Mode = def.Key
+			s.pages[key] = p
+			ns.Pages = append(ns.Pages, navLink{Title: p.Title, Href: "/" + key, Path: key})
+		}
+		if len(ns.Pages) > 0 {
+			s.sections = append(s.sections, ns)
+		}
 	}
 
-	var buf bytes.Buffer
-	if err := md.Convert(content, &buf); err != nil {
-		http.Error(w, "Render error", http.StatusInternalServerError)
-		return
-	}
-
-	page := Page{
-		Title:    path,
-		Content:  template.HTML(buf.String()),
-		Sections: sections,
-	}
-
-	tmpl := template.Must(template.New("page").Parse(tplHTML))
-	tmpl.Execute(w, page)
+	s.index = buildSearchIndex(s.pages)
+	logc.Fmt("\u2637", logc.Gray, "Wiki: \u5df2\u7d22\u5f15 %d \u4e2a\u9875\u9762", len(s.pages))
+	return s, nil
 }
 
-func listSections() []NavSection {
-	dirs, _ := DocsFS.ReadDir("docs")
-	var sections []NavSection
+func newMarkdown() goldmark.Markdown {
+	return goldmark.New(
+		goldmark.WithExtensions(extension.Table),
+		goldmark.WithParserOptions(parser.WithAutoHeadingID()),
+		goldmark.WithRendererOptions(
+			ghhtml.WithUnsafe(),
+			renderer.WithNodeRenderers(util.Prioritized(&codeBlockRenderer{}, 100)),
+		),
+	)
+}
 
-	for _, d := range dirs {
-		if !d.IsDir() {
+func listDocs(section string) ([]string, error) {
+	entries, err := DocsFS.ReadDir("docs/" + section)
+	if err != nil {
+		return nil, fmt.Errorf("读取文档目录 %s: %w", section, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
-		title := sectionNames[d.Name()]
-		if title == "" {
-			title = d.Name()
-		}
+		names = append(names, strings.TrimSuffix(e.Name(), ".md"))
+	}
+	return names, nil
+}
 
-		files, _ := DocsFS.ReadDir("docs/" + d.Name())
-		var pages []NavLink
-		for _, f := range files {
-			if !strings.HasSuffix(f.Name(), ".md") {
-				continue
-			}
-			name := strings.TrimSuffix(f.Name(), ".md")
-			content, err := DocsFS.ReadFile("docs/" + d.Name() + "/" + f.Name())
-			if err != nil {
-				continue
-			}
-			pageTitle := extractH1(string(content))
-			if pageTitle == "" {
-				pageTitle = name
-			}
-			pages = append(pages, NavLink{
-				Title: pageTitle,
-				Href:  "/" + d.Name() + "/" + name,
-			})
+func orderDocs(names, preferred []string) []string {
+	pos := make(map[string]int, len(preferred))
+	for i, n := range preferred {
+		pos[n] = i
+	}
+	sort.SliceStable(names, func(i, j int) bool {
+		pi, oki := pos[names[i]]
+		pj, okj := pos[names[j]]
+		switch {
+		case oki && okj:
+			return pi < pj
+		case oki:
+			return true
+		case okj:
+			return false
+		default:
+			return names[i] < names[j]
 		}
-		sort.Slice(pages, func(i, j int) bool {
-			return pages[i].Title < pages[j].Title
-		})
-		sections = append(sections, NavSection{
-			Name:  d.Name(),
-			Title: title,
-			Pages: pages,
-		})
+	})
+	return names
+}
+
+// headingIDs 生成稳定、可读、对中文友好的标题锚点，
+// 替代 goldmark 默认实现（后者会把非 ASCII 字符全部丢弃）。
+type headingIDs struct {
+	used map[string]int
+	seq  int
+}
+
+func newHeadingIDs() *headingIDs {
+	return &headingIDs{used: make(map[string]int)}
+}
+
+func (h *headingIDs) Generate(value []byte, _ ast.NodeKind) []byte {
+	base := slugify(string(value))
+	if base == "" {
+		h.seq++
+		base = fmt.Sprintf("section-%d", h.seq)
+	}
+	id := base
+	if n := h.used[base]; n > 0 {
+		h.used[base] = n + 1
+		id = fmt.Sprintf("%s-%d", base, n+1)
+	} else {
+		h.used[base] = 1
+	}
+	return []byte(id)
+}
+
+func (h *headingIDs) Put(value []byte) {
+	h.used[string(value)]++
+}
+
+func slugify(s string) string {
+	var b strings.Builder
+	dash := false
+	separate := func() {
+		if b.Len() > 0 && !dash {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'),
+			r >= 0x4E00 && r <= 0x9FFF, // CJK
+			r >= 0x3040 && r <= 0x30FF: // 日文假名
+			b.WriteRune(r)
+			dash = false
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+			dash = false
+		case r == '_':
+			b.WriteRune(r)
+			dash = false
+		default:
+			separate()
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func renderDoc(md goldmark.Markdown, key, section string, src []byte) (*docPage, error) {
+	ctx := parser.NewContext(parser.WithIDs(newHeadingIDs()))
+	node := md.Parser().Parse(text.NewReader(src), parser.WithContext(ctx))
+
+	var buf bytes.Buffer
+	if err := md.Renderer().Render(&buf, src, node); err != nil {
+		return nil, err
 	}
 
-	return sections
+	title := ""
+	var toc []tocEntry
+	_ = ast.Walk(node, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		h, ok := n.(*ast.Heading)
+		if !ok {
+			return ast.WalkContinue, nil
+		}
+		txt := cleanHeadingText(string(h.Text(src)))
+		switch h.Level {
+		case 1:
+			if title == "" {
+				title = txt
+			}
+		case 2, 3:
+			id := ""
+			if v, ok := h.AttributeString("id"); ok {
+				switch t := v.(type) {
+				case []byte:
+					id = string(t)
+				case string:
+					id = t
+				}
+			}
+			if id != "" && txt != "" {
+				toc = append(toc, tocEntry{Level: h.Level, Text: txt, ID: id})
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+
+	if title == "" {
+		title = strings.TrimSuffix(path.Base(key), ".md")
+	}
+
+	out := buf.String()
+	return &docPage{
+		Path:    key,
+		Section: section,
+		Title:   title,
+		HTML:    template.HTML(out),
+		TOC:     toc,
+		Plain:   plainText(out),
+	}, nil
 }
 
-func extractH1(md string) string {
-	for _, line := range strings.Split(md, "\n") {
-		if strings.HasPrefix(line, "# ") {
-			return strings.TrimPrefix(line, "# ")
+func cleanHeadingText(s string) string {
+	s = strings.ReplaceAll(s, "`", "")
+	s = strings.ReplaceAll(s, "*", "")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+var tagRE = regexp.MustCompile(`<[^>]*>`)
+
+func plainText(h string) string {
+	s := tagRE.ReplaceAllString(h, " ")
+	s = html.UnescapeString(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+type searchItem struct {
+	Path     string   `json:"p"`
+	Section  string   `json:"s"`
+	Title    string   `json:"t"`
+	Headings []string `json:"h"`
+	Text     string   `json:"x"`
+}
+
+func buildSearchIndex(pages map[string]*docPage) []byte {
+	keys := make([]string, 0, len(pages))
+	for k := range pages {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	items := make([]searchItem, 0, len(keys))
+	for _, k := range keys {
+		p := pages[k]
+		heads := make([]string, 0, len(p.TOC))
+		for _, t := range p.TOC {
+			heads = append(heads, t.Text)
+		}
+		items = append(items, searchItem{
+			Path:     p.Path,
+			Section:  p.Section,
+			Title:    p.Title,
+			Headings: heads,
+			Text:     truncateRunes(p.Plain, 20000),
+		})
+	}
+	b, err := json.Marshal(items)
+	if err != nil {
+		return []byte("[]")
+	}
+	return b
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+func sectionTitle(key string) string {
+	switch key {
+	case "basic":
+		return "普通版"
+	case "pro":
+		return "专业版"
+	default:
+		return "文档"
+	}
+}
+
+func neighbors(s *site, key string) (prev, next *navLink) {
+	var flat []navLink
+	for _, sec := range s.sections {
+		flat = append(flat, sec.Pages...)
+	}
+	idx := -1
+	for i := range flat {
+		if flat[i].Path == key {
+			idx = i
+			break
 		}
 	}
-	return ""
+	if idx < 0 {
+		return nil, nil
+	}
+	if idx > 0 {
+		prev = &flat[idx-1]
+	}
+	if idx < len(flat)-1 {
+		next = &flat[idx+1]
+	}
+	return prev, next
 }
 
-const tplHTML = `<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{.Title}} — Quill Wiki</title>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; min-height: 100vh; }
-nav { width: 240px; background: #161b22; padding: 20px; border-right: 1px solid #30363d; flex-shrink: 0; overflow-y: auto; }
-nav h2 { color: #58a6ff; margin-bottom: 16px; font-size: 16px; }
-nav a { display: block; color: #8b949e; text-decoration: none; padding: 5px 8px; border-radius: 6px; font-size: 13px; }
-nav a:hover { color: #c9d1d9; background: #21262d; }
-nav .nav-section { color: #484f58; font-size: 11px; text-transform: uppercase; padding: 12px 8px 4px; letter-spacing: 1px; }
-.mode-toggle { padding: 6px 10px; background: #21262d; border-radius: 6px; display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
-.mode-toggle span { font-size: 12px; color: #8b949e; cursor: pointer; padding: 2px 8px; border-radius: 4px; }
-.mode-toggle span.active { color: #fff; background: #30363d; }
-main { flex: 1; padding: 40px 48px; max-width: 860px; }
-main h1 { color: #f0f6fc; font-size: 28px; border-bottom: 1px solid #21262d; padding-bottom: 8px; margin-bottom: 24px; }
-main h2 { color: #f0f6fc; font-size: 20px; margin: 32px 0 12px; }
-main h3 { color: #f0f6fc; font-size: 16px; margin: 24px 0 8px; }
-main p { line-height: 1.7; margin-bottom: 12px; }
-main code { background: #161b22; padding: 2px 6px; border-radius: 4px; font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace; font-size: 13px; color: #d2a8ff; }
-main pre { background: #161b22; padding: 16px; border-radius: 8px; overflow-x: auto; margin: 12px 0; border: 1px solid #30363d; }
-main pre code { background: none; padding: 0; color: #c9d1d9; }
-main ul, main ol { margin: 8px 0 12px 24px; line-height: 1.7; }
-main a { color: #58a6ff; }
-main table { border-collapse: collapse; width: 100%; margin: 16px 0; }
-main th, main td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; font-size: 14px; }
-main th { background: #161b22; }
-main hr { border: none; border-top: 1px solid #21262d; margin: 32px 0; }
-.pro-only { display: none; }
-.basic-only { display: block; }
-body.pro .pro-only { display: block; }
-body.pro .basic-only { display: none; }
-</style>
-</head>
-<body class="basic">
-<nav>
-  <h2>Quill Wiki</h2>
-  <div class="mode-toggle">
-    <span class="active" onclick="setMode('basic')">普通</span>
-    <span onclick="setMode('pro')">专业</span>
-  </div>
-  {{range .Sections}}
-  <div class="nav-section">{{.Title}}</div>
-  {{range .Pages}}
-  <a href="{{.Href}}">{{.Title}}</a>
-  {{end}}
-  {{end}}
-</nav>
-<main>{{.Content}}</main>
-<script>
-function setMode(m) {
-  document.body.className = m;
-  document.querySelectorAll('.mode-toggle span').forEach(s => s.classList.toggle('active', s.textContent === (m==='basic'?'普通':'专业')));
-  localStorage.setItem('wiki-mode', m);
+type pageData struct {
+	Title        string
+	Path         string
+	SectionTitle string
+	Mode         string
+	Content      template.HTML
+	TOC          []tocEntry
+	Prev         *navLink
+	Next         *navLink
+	Sections     []navSection
+	Description  string
+	Assets       string
 }
-var saved = localStorage.getItem('wiki-mode');
-if (saved) setMode(saved);
-</script>
-</body>
-</html>`
+
+var pageTemplate = template.Must(template.New("page").Parse(pageTemplateHTML))
+
+func Serve(addr string) error {
+	if _, err := getSite(); err != nil {
+		return fmt.Errorf("构建 Wiki: %w", err)
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           newHandler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	logc.Fmt("\u2637", logc.Gray, "Wiki: http://localhost%s", addr)
+	return srv.ListenAndServe()
+}
+
+func newHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/assets/", handleAsset)
+	mux.HandleFunc("/wiki-index.json", handleSearchIndex)
+	mux.HandleFunc("/", handlePage)
+	return mux
+}
+
+func handlePage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "405 method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s, err := getSite()
+	if err != nil {
+		http.Error(w, "Wiki 初始化失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if p := r.URL.Path; p != "/" && strings.HasSuffix(p, "/") {
+		target := strings.TrimRight(p, "/")
+		if target == "" {
+			target = "/"
+		}
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+		return
+	}
+
+	key := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+	switch key {
+	case "", "index.html", "index.htm":
+		key = "index"
+	}
+
+	page, ok := s.pages[key]
+	if !ok {
+		data := &pageData{
+			Title:        "页面不存在",
+			Path:         key,
+			SectionTitle: "错误",
+			Mode:         "basic",
+			Sections:     s.sections,
+			Content:      template.HTML(notFoundContent(key)),
+			Description:  "页面不存在",
+		}
+		renderHTML(w, data, http.StatusNotFound)
+		return
+	}
+
+	prev, next := neighbors(s, key)
+	data := &pageData{
+		Title:        page.Title,
+		Path:         key,
+		SectionTitle: sectionTitle(page.Section),
+		Mode:         page.Mode,
+		Content:      page.HTML,
+		TOC:          page.TOC,
+		Prev:         prev,
+		Next:         next,
+		Sections:     s.sections,
+		Description:  truncateRunes(page.Plain, 120),
+	}
+	if data.Mode == "" {
+		data.Mode = "basic"
+	}
+	renderHTML(w, data, http.StatusOK)
+}
+
+func notFoundContent(key string) string {
+	return `<h1>页面不存在</h1>
+<p>没有找到文档 <code>` + template.HTMLEscapeString(key) + `</code>。</p>
+<p><a href="/">返回文档首页</a></p>`
+}
+
+func renderHTML(w http.ResponseWriter, data *pageData, status int) {
+	data.Assets = assetVersion()
+	var buf bytes.Buffer
+	if err := pageTemplate.Execute(&buf, data); err != nil {
+		http.Error(w, "渲染失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.WriteHeader(status)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func handleSearchIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "405 method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s, err := getSite()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(s.index)
+}
+
+func handleAsset(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/assets/")
+	var ctype string
+	switch name {
+	case "wiki.css":
+		ctype = "text/css; charset=utf-8"
+	case "wiki.js":
+		ctype = "application/javascript; charset=utf-8"
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	data, err := StaticFS.ReadFile("static/" + name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", ctype)
+	if r.URL.RawQuery != "" {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(data)
+}

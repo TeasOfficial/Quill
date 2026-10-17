@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -42,7 +43,15 @@ type Manager struct {
 	logDone    chan struct{}
 	memFS      map[string][]byte
 	memFSMu    sync.RWMutex
+	done       chan struct{}
+	startOnce  sync.Once
+	closeOnce  sync.Once
+	closed     bool
 }
+
+// pluginTimeout 是单次事件分发与定时器回调的执行上限。
+// 超时后 gopher-lua 会中断 Lua 代码，避免一个插件卡死整个 bot。
+const pluginTimeout = 5 * time.Second
 
 type logEntry struct {
 	level string
@@ -70,18 +79,47 @@ func NewManager(client *onebot.Client, db *storage.DB, fileUnsafe bool) *Manager
 		logCh:      make(chan logEntry, 256),
 		logDone:    make(chan struct{}),
 		memFS:      make(map[string][]byte),
+		done:       make(chan struct{}),
 	}
 	go m.logWriter()
 	m.registerBotAPI()
 	return m
 }
 
+// Start 启动后台定时器循环。未调用时 util.After 注册的定时器不会自动执行。
+func (m *Manager) Start() {
+	m.startOnce.Do(func() {
+		go m.timerLoop()
+	})
+}
+
+func (m *Manager) timerLoop() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			if !m.closed {
+				m.processTimersLocked()
+			}
+			m.mu.Unlock()
+		}
+	}
+}
+
 func (m *Manager) Close() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	close(m.logCh)
-	<-m.logDone
-	m.L.Close()
+	m.closeOnce.Do(func() {
+		close(m.done)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.closed = true
+		close(m.logCh)
+		<-m.logDone
+		m.L.Close()
+	})
 }
 
 func (m *Manager) logWriter() {
@@ -101,7 +139,10 @@ func (m *Manager) registerBotAPI() {
 
 	L.SetField(bot, "send_group_msg", L.NewFunction(func(L *lua.LState) int {
 		groupID := L.CheckInt64(1)
-		msg := luaValueToMsg(L.Get(2))
+		msg, ok := m.msgFromLua(L, 2)
+		if !ok {
+			return 2
+		}
 		msgID, err := m.client.SendGroupMsg(groupID, msg)
 		if err != nil {
 			L.Push(lua.LNil)
@@ -114,7 +155,10 @@ func (m *Manager) registerBotAPI() {
 
 	L.SetField(bot, "send_private_msg", L.NewFunction(func(L *lua.LState) int {
 		userID := L.CheckInt64(1)
-		msg := luaValueToMsg(L.Get(2))
+		msg, ok := m.msgFromLua(L, 2)
+		if !ok {
+			return 2
+		}
 		msgID, err := m.client.SendPrivateMsg(userID, msg)
 		if err != nil {
 			L.Push(lua.LNil)
@@ -144,7 +188,10 @@ func (m *Manager) registerBotAPI() {
 		} else {
 			groupID = L.CheckInt64(2)
 		}
-		msg := luaValueToMsg(L.Get(3))
+		msg, ok := m.msgFromLua(L, 3)
+		if !ok {
+			return 2
+		}
 		msgID, err := m.client.SendMsg(msgType, userID, groupID, msg)
 		if err != nil {
 			L.Push(lua.LNil)
@@ -954,7 +1001,19 @@ func (m *Manager) registerBotAPI() {
 	}))
 	L.SetField(util, "Sleep", L.NewFunction(func(L *lua.LState) int {
 		sec := L.CheckNumber(1)
-		time.Sleep(time.Duration(float64(sec) * float64(time.Second)))
+		d := time.Duration(float64(sec) * float64(time.Second))
+		ctx := L.Context()
+		if ctx == nil {
+			time.Sleep(d)
+			return 0
+		}
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			L.RaiseError("sleep interrupted: %v", ctx.Err())
+		}
 		return 0
 	}))
 	L.SetField(util, "After", L.NewFunction(func(L *lua.LState) int {
@@ -1110,8 +1169,13 @@ func (m *Manager) safeFilePath(rel string) (string, error) {
 
 func resolveSafe(rel, root string) (string, error) {
 	clean := filepath.Clean(rel)
-	if strings.Contains(clean, "..") {
-		return "", fmt.Errorf("path not allowed: %s", rel)
+	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" {
+		return "", fmt.Errorf("absolute path not allowed: %s", rel)
+	}
+	for _, part := range strings.Split(filepath.ToSlash(clean), "/") {
+		if part == ".." {
+			return "", fmt.Errorf("path not allowed: %s", rel)
+		}
 	}
 	base := root
 	if base == "" {
@@ -1127,7 +1191,10 @@ func resolveSafe(rel, root string) (string, error) {
 			return "", fmt.Errorf("path outside data dir: %s", rel)
 		}
 	}
-	real, err := filepath.EvalSymlinks(abs)
+
+	// 目标可能尚不存在（新建文件/目录），此时只校验最近的已存在祖先，
+	// 否则写入新文件会直接失败。
+	real, err := evalExisting(abs)
 	if err != nil {
 		return "", fmt.Errorf("resolve symlinks: %w", err)
 	}
@@ -1138,6 +1205,20 @@ func resolveSafe(rel, root string) (string, error) {
 		}
 	}
 	return abs, nil
+}
+
+// evalExisting 逐级向上找到第一个存在的路径并解析其符号链接。
+func evalExisting(p string) (string, error) {
+	for {
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			return resolved, nil
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return "", fmt.Errorf("cannot resolve %s", p)
+		}
+		p = parent
+	}
 }
 
 func digTable(t *lua.LTable, path string) lua.LValue {
@@ -1156,37 +1237,70 @@ func digTable(t *lua.LTable, path string) lua.LValue {
 	return t
 }
 
-func luaValueToMsg(v lua.LValue) interface{} {
+// luaValueToMsg 把 Lua 值转换成 OneBot 消息。
+// 字符串/数字直接当文本；table 按消息段数组处理，
+// 数组里的字符串会被当成 text 段，类型错误返回 error 而不是 panic。
+func luaValueToMsg(v lua.LValue) (interface{}, error) {
 	switch val := v.(type) {
 	case lua.LString:
-		return string(val)
+		return string(val), nil
+	case lua.LNumber:
+		return fmt.Sprint(float64(val)), nil
 	case *lua.LTable:
 		var segments []map[string]interface{}
+		var segErr error
 		val.ForEach(func(_, seg lua.LValue) {
-			tbl, ok := seg.(*lua.LTable)
-			if !ok {
+			if segErr != nil {
 				return
 			}
-			segMap := make(map[string]interface{})
-			typ := tbl.RawGetString("type")
-			if typ != lua.LNil {
-				segMap["type"] = string(typ.(lua.LString))
-			}
-			dataVal := tbl.RawGetString("data")
-			if dataVal != lua.LNil {
-				if dataTbl, ok := dataVal.(*lua.LTable); ok {
+			switch s := seg.(type) {
+			case lua.LString:
+				segments = append(segments, textSegment(string(s)))
+			case lua.LNumber:
+				segments = append(segments, textSegment(fmt.Sprint(float64(s))))
+			case *lua.LTable:
+				typ, ok := s.RawGetString("type").(lua.LString)
+				if !ok {
+					segErr = fmt.Errorf("消息段缺少字符串类型的 type 字段")
+					return
+				}
+				segMap := map[string]interface{}{"type": string(typ)}
+				if dataTbl, ok := s.RawGetString("data").(*lua.LTable); ok {
 					dataMap := make(map[string]interface{})
 					dataTbl.ForEach(func(k, dv lua.LValue) {
-						dataMap[string(k.(lua.LString))] = luaValueToSimple(dv)
+						dataMap[k.String()] = luaValueToSimple(dv)
 					})
 					segMap["data"] = dataMap
 				}
+				segments = append(segments, segMap)
+			default:
+				segErr = fmt.Errorf("不支持的消息段类型: %s", seg.Type().String())
 			}
-			segments = append(segments, segMap)
 		})
-		return segments
+		if segErr != nil {
+			return nil, segErr
+		}
+		return segments, nil
 	}
-	return ""
+	return "", nil
+}
+
+func textSegment(text string) map[string]interface{} {
+	return map[string]interface{}{
+		"type": "text",
+		"data": map[string]interface{}{"text": text},
+	}
+}
+
+// msgFromLua 读取并转换消息参数；失败时把 nil+err 压栈并返回 false。
+func (m *Manager) msgFromLua(L *lua.LState, idx int) (interface{}, bool) {
+	msg, err := luaValueToMsg(L.Get(idx))
+	if err != nil {
+		L.Push(lua.LNil)
+		L.Push(lua.LString(err.Error()))
+		return nil, false
+	}
+	return msg, true
 }
 
 func luaValueToSimple(v lua.LValue) interface{} {
@@ -1243,6 +1357,7 @@ func (m *Manager) UnloadPlugins() {
 func (m *Manager) doUnloadPlugins() {
 	m.registry = m.L.NewTable()
 	m.L.SetGlobal("__plugin_registry", m.registry)
+	m.timers = nil
 	logc.Fmt("\u2715", logc.Gray, "\u5df2\u5378\u8f7d\u5168\u90e8\u63d2\u4ef6")
 }
 
@@ -1303,14 +1418,19 @@ func (m *Manager) doLoadPlugins(dir string) error {
 			L.RaiseError("include %s: %v", target, err)
 			return 0
 		}
-		source = preprocessLua(source)
-		if err := L.DoString(string(source)); err != nil {
+		fn, err := L.Load(strings.NewReader(string(source)), targetPath)
+		if err != nil {
 			L.RaiseError("include %s: %v", target, err)
 			return 0
 		}
-
+		before := L.GetTop()
+		L.Push(fn)
+		if err := L.PCall(0, lua.MultRet, nil); err != nil {
+			L.RaiseError("include %s: %v", target, err)
+			return 0
+		}
 		L.SetGlobal("__plugin_dir", prevDir)
-		return 1
+		return L.GetTop() - before
 	}))
 
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -1334,15 +1454,18 @@ func (m *Manager) doLoadPlugins(dir string) error {
 func (m *Manager) doPluginFile(baseDir, path string) error {
 	m.L.SetGlobal("__plugin_dir", lua.LString(filepath.Dir(path)))
 
+	base := m.L.GetTop()
+	defer m.L.SetTop(base)
+	defer func() {
+		if r := recover(); r != nil {
+			logc.Fmt("!", logc.Yellow, "插件加载崩溃 %s: %v", path, r)
+			m.L.SetTop(base)
+		}
+	}()
+
 	source, err := os.ReadFile(path)
 	if err != nil {
 		logc.Fmt("!", logc.Yellow, "插件读取失败 %s: %v", path, err)
-		return nil
-	}
-	source = preprocessLua(source)
-
-	if err := m.L.DoString(string(source)); err != nil {
-		logc.Fmt("!", logc.Yellow, "插件加载失败 %s: %v", path, err)
 		return nil
 	}
 
@@ -1350,26 +1473,44 @@ func (m *Manager) doPluginFile(baseDir, path string) error {
 	fileName := strings.TrimSuffix(rel, ".lua")
 	fileName = strings.ReplaceAll(fileName, string(filepath.Separator), "/")
 
-	pluginTable := m.L.Get(-1)
+	fn, err := m.L.Load(strings.NewReader(string(source)), path)
+	if err != nil {
+		logc.Fmt("!", logc.Yellow, "插件语法错误 %s: %v", fileName, err)
+		return nil
+	}
 
-	tbl, ok := pluginTable.(*lua.LTable)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.L.SetContext(ctx)
+	defer m.L.RemoveContext()
+
+	m.L.Push(fn)
+	if err := m.L.PCall(0, lua.MultRet, nil); err != nil {
+		logc.Fmt("!", logc.Yellow, "插件加载失败 %s: %v", fileName, err)
+		return nil
+	}
+
+	n := m.L.GetTop() - base
+	if n <= 0 {
+		logc.Fmt("!", logc.Gray, "跳过 %s (未返回 table)", fileName)
+		return nil
+	}
+
+	tbl, ok := m.L.Get(m.L.GetTop()).(*lua.LTable)
 	if !ok {
 		logc.Fmt("!", logc.Gray, "跳过 %s (未返回 table)", fileName)
-		m.L.Pop(1)
 		return nil
 	}
 
 	info := tbl.RawGetString("PluginInfo")
 	if info == lua.LNil {
 		logc.Fmt("!", logc.Red, "加载失败 %s: 缺少 PluginInfo", fileName)
-		m.L.Pop(1)
 		return nil
 	}
 
 	infoTbl, ok := info.(*lua.LTable)
 	if !ok {
 		logc.Fmt("!", logc.Red, "加载失败 %s: PluginInfo 不是 table", fileName)
-		m.L.Pop(1)
 		return nil
 	}
 
@@ -1377,7 +1518,6 @@ func (m *Manager) doPluginFile(baseDir, path string) error {
 	pVer := stringOf(infoTbl.RawGetString("version"))
 	if pName == "" || pVer == "" {
 		logc.Fmt("!", logc.Red, "加载失败 %s: PluginInfo 缺少 name 或 version", fileName)
-		m.L.Pop(1)
 		return nil
 	}
 
@@ -1401,17 +1541,7 @@ func (m *Manager) doPluginFile(baseDir, path string) error {
 
 	m.registry.RawSetString(displayName, tbl)
 	logc.Fmt("\u25C6", logc.Magenta, "已加载插件: %s %s", displayName, extra)
-	m.L.Pop(1)
 	return nil
-}
-
-func preprocessLua(src []byte) []byte {
-	s := string(src)
-	s = strings.ReplaceAll(s, "!=", "~=")
-	s = strings.ReplaceAll(s, "||", " or ")
-	s = strings.ReplaceAll(s, "&&", " and ")
-	s = strings.ReplaceAll(s, "!", "not ")
-	return []byte(s)
 }
 
 func stringOf(v lua.LValue) string {
@@ -1424,15 +1554,33 @@ func stringOf(v lua.LValue) string {
 	return v.String()
 }
 
+// callLua 在独立的超时上下文中执行一个 Lua 函数。
+// 超时/panic 都会转换成 error，不会影响后续事件。
+func (m *Manager) callLua(fn lua.LValue, args ...lua.LValue) (err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pluginTimeout)
+	defer cancel()
+
+	m.L.SetContext(ctx)
+	defer m.L.RemoveContext()
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	m.L.Push(fn)
+	for _, a := range args {
+		m.L.Push(a)
+	}
+	return m.L.PCall(len(args), 0, nil)
+}
+
 func (m *Manager) Dispatch(event *onebot.Event) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.processTimers(m.L)
 	eventTbl := eventToTable(m.L, event)
-
 	handlerKey, fallbackKey := routeEvent(event)
-	L := m.L
 
 	m.registry.ForEach(func(name, plugin lua.LValue) {
 		tbl, ok := plugin.(*lua.LTable)
@@ -1447,29 +1595,36 @@ func (m *Manager) Dispatch(event *onebot.Event) {
 			return
 		}
 
-		L.Push(handler)
-		L.Push(eventTbl)
-		if err := L.PCall(1, 0, nil); err != nil {
+		if err := m.callLua(handler, eventTbl); err != nil {
 			logc.Fmt("!", logc.Red, "[%s] %s 错误: %v", name, handlerKey, err)
 		}
 	})
 }
 
-func (m *Manager) processTimers(L *lua.LState) {
+// processTimersLocked 执行到期的定时器。调用方必须持有 m.mu。
+// 先把未到期的定时器收回 m.timers，再执行回调，
+// 这样回调里新注册的定时器（轮询模式）不会被覆盖丢失。
+func (m *Manager) processTimersLocked() {
 	if len(m.timers) == 0 {
 		return
 	}
 	now := time.Now()
-	remaining := make([]timerEntry, 0, len(m.timers))
+	due := make([]timerEntry, 0, len(m.timers))
+	keep := make([]timerEntry, 0, len(m.timers))
 	for _, t := range m.timers {
-		if !now.Before(t.deadline) {
-			L.Push(t.fn)
-			L.PCall(0, 0, nil)
+		if now.Before(t.deadline) {
+			keep = append(keep, t)
 		} else {
-			remaining = append(remaining, t)
+			due = append(due, t)
 		}
 	}
-	m.timers = remaining
+	m.timers = keep
+
+	for _, t := range due {
+		if err := m.callLua(t.fn); err != nil {
+			logc.Fmt("!", logc.Red, "[定时器] 执行错误: %v", err)
+		}
+	}
 }
 
 func routeEvent(e *onebot.Event) (key, fallback string) {

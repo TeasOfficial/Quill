@@ -26,10 +26,10 @@ bot.send_group_msg(group_id, content)
 
 ```lua
 -- 纯文本
-bot.send_group_msg(671812808, "Hello")
+bot.send_group_msg(123456789, "Hello")
 
 -- 消息段数组
-bot.send_group_msg(671812808, {
+bot.send_group_msg(123456789, {
     bot.at(123456),
     bot.text(" 你好"),
     bot.image("https://example.com/pic.jpg"),
@@ -73,7 +73,7 @@ bot.send_msg(message_type, id, content)
 | `content` | string 或 table | 纯文本或消息段数组 |
 
 ```lua
-bot.send_msg("group", 671812808, "群消息")
+bot.send_msg("group", 123456789, "群消息")
 bot.send_msg("private", 123456, "私聊消息")
 ```
 

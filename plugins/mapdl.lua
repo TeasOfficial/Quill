@@ -5,9 +5,14 @@
 -- 使用内置 util.download_file + util.extract_archive
 -- ============================================================
 
-local FASTDL_BASE = "https://main.fastdl.me/maps/"
-local MAPS_DIR     = [[E:\TeasBunnyHop Private\Counter-Strike Source Dedicated Server\cstrike\maps]]
-local TEMP_DIR     = [[E:\TeasBunnyHop Private\bot\mapdl_temp]]
+-- 本机路径通过 .env 配置，不要把目录写进仓库。
+-- MAPDL_MAPS_DIR    CS:S 服务器的 cstrike/maps 目录（必填，不填则插件提示未配置）
+-- MAPDL_TEMP_DIR    下载临时目录（可选，默认 mapdl_temp）
+-- MAPDL_FASTDL_BASE 地图源（可选）
+local FASTDL_BASE = util.GetEnv("MAPDL_FASTDL_BASE") or "https://main.fastdl.me/maps/"
+local MAPS_DIR    = util.GetEnv("MAPDL_MAPS_DIR") or ""
+local TEMP_DIR    = util.GetEnv("MAPDL_TEMP_DIR") or "mapdl_temp"
+local CONFIGURED  = MAPS_DIR ~= ""
 
 -- ============================================================
 -- 内置模块 (util.download_file / util.extract_archive)
@@ -76,6 +81,11 @@ end
 function Quill.on_group_message(event)
     local msg = event.raw_message
     if not msg:match("^/mapd[el]") then
+        return
+    end
+
+    if not CONFIGURED then
+        reply(event, " ⚠ 未配置 MAPDL_MAPS_DIR（在 .env 中设置 cstrike/maps 目录）")
         return
     end
 

@@ -40,7 +40,7 @@ return Quill
 ```
 
 > 缺少 `PluginInfo`、或缺少 `name`/`version` 的插件会被拒绝加载。
-> **文件结尾必须有 `return`**：当前加载器遇到没有返回值的 `.lua` 文件会触发 panic 并终止进程，详见「已知问题」。
+> **文件结尾必须有 `return`**：没有返回值的 `.lua` 文件会被跳过并记录日志（不会导致进程退出）。
 
 目录插件用 `init.lua` 入口，同目录其他 `.lua` 用 `include("filename")` 加载。
 
@@ -218,7 +218,7 @@ MemFS.Write/Read/Delete/Exists/List/Clear/Dump/Load  -- 内存键值存储
 ```
 
 > AES 的 key **不硬编码**在源码中，用 `util.GetEnv("MY_KEY")` 从 .env 读。
-> `GetEnv` 禁止读 `ONEBOT_*` 前缀的变量（但 Lua 标准库 `os.getenv` 不受此限制，见「已知问题」）。
+> `GetEnv` 禁止读 `ONEBOT_*` 前缀的变量（但 Lua 标准库 `os.getenv` 不受此限制，见「安全 & 限制」）。
 > `IsSafePath` 检查 `..` 与符号链接。
 
 ### 内置网络能力
@@ -227,7 +227,7 @@ MemFS.Write/Read/Delete/Exists/List/Clear/Dump/Load  -- 内存键值存储
 `{"ok":true,"status":200,"body":"...","headers":{...}}` 或 `{"ok":false,"error":"..."}`。
 
 ```lua
--- 同步 HTTP GET（默认 15 分钟超时）
+-- 同步 HTTP GET（默认 60 秒超时；受 5 秒事件上限约束）
 local raw  = util.http_get("https://api.example.com/data")
 local resp = util.JSONToTable(raw)
 if resp.ok then
@@ -259,7 +259,7 @@ local ok, err = util.extract_archive("downloads/big.zip", "downloads/out")
 支持的压缩格式：`.zip`、`.tar`、`.tar.gz`/`.tgz`、`.tar.bz2`/`.tbz2`、`.gz`、`.bz2`。
 解压内置路径穿越防护，拒绝逃出目标目录的条目。
 
-> `download_file` 的目标路径**不受** `data/` 沙箱限制，多线程进度统计目前不完整，详见「已知问题」。
+> `download_file` 的目标路径**不受** `data/` 沙箱限制，请只下载可信来源的 URL。
 
 ### 持久存储
 
@@ -300,7 +300,8 @@ end)
 util.CancelTimer(id)
 ```
 
-定时器由事件分发驱动：只有新事件到达时才会检查并触发到期回调，不保证精确定时。
+定时器由后台循环驱动（约 200ms 粒度），无需等待新事件；每个回调同样受 5 秒执行上限约束。
+回调内可以再次调用 `util.After` 实现轮询，不会被丢弃。
 
 ---
 
@@ -364,9 +365,13 @@ end
 
 ### 超时
 
-宿主**没有**事件级超时保护：单次事件分发会串行执行所有插件，直到全部返回。
-`util.http_get` / `http_post` 的默认超时为 15 分钟，长请求会一直占住事件循环。
-需要在插件内自行控制：使用 `util.http_request` 的 `timeout` 字段，或改用异步下载。
+每个事件 handler 与每个定时器回调都有 **5 秒**执行上限；超时后 gopher-lua 会中断该段 Lua 代码，
+记录一条错误日志，然后继续处理后续事件。
+
+`util.http_get` / `http_post` 默认超时 60 秒，`util.Sleep` 会被超时打断。
+由于外层 5 秒上限，同步 HTTP 实际最多占用约 5 秒；需要更久的任务请用 `util.download_file`（异步）。
+
+> 事件分发仍是串行的：同一时间只有一个 handler 在执行，其他事件排队。
 
 ---
 
@@ -377,22 +382,19 @@ end
 | 插件隔离 | **无沙箱**。插件与宿主同进程，Lua `io`/`os`/`debug` 标准库可用 |
 | 文件沙箱 | 仅 `bot.file` 与 `util.MemFS` 限定在 `data/`；`util.download_file` 可写任意路径 |
 | 环境隔离 | `util.GetEnv` 不返回 `ONEBOT_*`；但 `os.getenv` 可直接读取 |
-| 事件并发 | 串行分发，单次 dispatch 持有全局锁 |
-| HTTP | 内置请求默认关闭 TLS 证书校验 |
+| 事件并发 | 串行分发；单次 handler / 定时器 5 秒上限 |
+| HTTP | 默认校验证书；`ONEBOT_HTTP_INSECURE=true` 可关闭（高危，仅限自签环境） |
 | 日志截断 | 单条日志上限 500 字符 |
 
 ---
 
-## 已知问题（编写插件时请规避）
+## 已知限制
 
-| 现象 | 规避方式 |
-|------|----------|
-| `.lua` 文件没有 `return` 时，加载器 panic 并终止进程 | 每个插件/模块文件都以 `return` 结束 |
-| 宿主会把源码中的 ASCII `!` 替换成 `not `，且会破坏字符串字面量 | 不要使用 `!`、`&&`、`||`；写标准 Lua 5.1，字符串中避免出现 `!` |
-| `bot.file.write` / `MemFS.Dump` 对**新建**文件报 `resolve symlinks` 错误 | 先手工创建文件，或改用 `io.open`（注意沙箱边界） |
-| 在 `util.After` 回调中再次 `util.After` 会被丢弃 | 定时器内不要自续约，改用事件驱动 |
-| 多线程下载的 `percent` / `downloaded` 始终为 0 | 仅用 `done` 与 `error` 判断结果 |
-| 消息段 `type` 传非字符串会导致进程 panic | 只用 `bot.text/image/...` 构造器，不要手搓表 |
+| 现象 | 说明 |
+|------|------|
+| 事件分发串行 | 一个插件执行期间其他事件排队等待 |
+| 定时器精度 | 后台循环每 200ms 检查一次，触发时间有 0~200ms 偏差 |
+| 插件无沙箱 | 等同本机代码，只安装可信插件 |
 
 ---
 
@@ -405,4 +407,4 @@ end
 - [ ] 事件 handler 名从上面 18 种中选
 - [ ] 用了 AES 密钥则通过 `util.GetEnv` 读取
 - [ ] 路径相关操作用 `bot.file`（限定 `data/`）
-- [ ] 避免 ASCII `!`、长阻塞调用与定时器自续约
+- [ ] 避免单次 handler 长时间阻塞（5 秒上限），耗时任务用 `util.download_file`
