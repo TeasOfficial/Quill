@@ -2,19 +2,30 @@
 
 ## 插件写法
 
-每个插件是 `plugins/` 下的 `.lua` 文件，**返回一个函数表**。
+每个插件是 `plugins/` 下的 `.lua` 文件，**必须返回一个包含 `PluginInfo` 的表**。
+
+`PluginInfo` 必须包含 `name`（插件名）和 `version`（版本号），可选 `author`（作者）和 `update_url`（更新地址）。
 
 ### 单文件插件
 
 ```lua
 -- plugins/hello.lua
-return {
-    on_group_message = function(event)
-        if event.raw_message == "你好" then
-            bot.send_group_msg(event.group_id, "你也好！")
-        end
-    end,
+local Quill = {}
+
+Quill.PluginInfo = {
+    name = "hello",
+    version = "1.0.0",
+    author = "你的名字",        -- 可选
+    update_url = "..."          -- 可选
 }
+
+Quill.on_group_message = function(event)
+    if event.raw_message == "你好" then
+        bot.send_group_msg(event.group_id, "你也好！")
+    end
+end
+
+return Quill
 ```
 
 ### 目录插件（init.lua）
@@ -31,31 +42,38 @@ plugins/
 
 ```lua
 -- plugins/admin/init.lua
+local Quill = {}
+
+Quill.PluginInfo = {
+    name = "admin",
+    version = "1.0.0",
+    author = "你的名字",
+}
+
 local utils = include("utils")
 local cfg = include("config")
 
-return {
-    on_group_message = function(event)
-        if event.raw_message == "/info" then
-            bot.send_group_msg(event.group_id, utils.stats())
-        end
-    end,
-}
+Quill.on_group_message = function(event)
+    if event.raw_message == "/info" then
+        bot.send_group_msg(event.group_id, utils.stats())
+    end
+end
+
+return Quill
 ```
 
 `include("xxx")` 自动补 `.lua`，支持子目录：`include("sub/file")`。不能加载到插件目录外。
 
-## 调用 WASM 模块
+## 调用内置函数
+
+HTTP 请求、下载、解压等已内置为 `util` 函数，无需额外加载：
 
 ```lua
-local http = module("http")
-if http then
-    local resp = http.get("https://api.example.com/data")
-    bot.send_group_msg(event.group_id, "返回 " .. resp)
-end
+local resp = util.http_get("https://api.example.com/data")
+bot.send_group_msg(event.group_id, "返回 " .. resp)
 ```
 
-`module("name")` 返回模块的 Lua 表，模块名为 `module.json` 中的 `name`。模块未加载时返回 `nil`。
+参见 [util API 参考](util_api) 中的「网络操作」章节。
 
 ## 事件类型
 
@@ -128,6 +146,13 @@ end
 | `util.Sleep(seconds)` | 延迟指定秒数后继续执行（**阻塞**） |
 | `util.After(seconds, fn)` | 延迟指定秒数后执行回调（**非阻塞**），返回定时器 ID |
 | `util.CancelTimer(id)` | 取消指定 ID 的定时器 |
+| `util.http_get(url)` | HTTP GET 请求，返回 JSON 响应字符串 |
+| `util.http_post(url)` | HTTP POST 请求，返回 JSON 响应字符串 |
+| `util.http_request(req)` | 完整参数 HTTP 请求，传入 JSON |
+| `util.download_file(url, path, threads?)` | 异步多线程下载，返回任务 ID |
+| `util.download_poll(task_id)` | 查询下载任务进度 |
+| `util.download_list()` | 列出所有下载任务 |
+| `util.extract_archive(file, dest)` | 解压 (zip/tar/gz/bz2)，含路径穿越防护 |
 
 > ⚠️ `AESEncrypt` / `AESDecrypt` 的 key **不应硬编码在插件源码中**。建议用 `util.GetEnv("MY_KEY")` 从 `.env` 读取。
 

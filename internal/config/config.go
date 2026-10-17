@@ -1,4 +1,4 @@
-﻿package config
+package config
 
 import (
 	"os"
@@ -10,12 +10,12 @@ import (
 )
 
 type Config struct {
-	BaseURL   string
-	WSURL     string
-	Token     string
-	WSMode    string
-	WSListen  string
-	WSPath    string
+	BaseURL    string
+	WSURL      string
+	Token      string
+	WSMode     string
+	WSListen   string
+	WSPath     string
 	FileUnsafe bool
 }
 

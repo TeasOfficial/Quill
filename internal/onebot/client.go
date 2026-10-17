@@ -138,3 +138,260 @@ func (c *Client) GetForwardMsg(messageID string) (json.RawMessage, error) {
 	}
 	return resp.Data, nil
 }
+
+func (c *Client) SendLike(userID int64, times int) error {
+	_, err := c.apiCall("send_like", map[string]interface{}{
+		"user_id": userID,
+		"times":   times,
+	})
+	return err
+}
+
+func (c *Client) SetGroupKick(groupID, userID int64, rejectAddRequest bool) error {
+	_, err := c.apiCall("set_group_kick", map[string]interface{}{
+		"group_id":           groupID,
+		"user_id":            userID,
+		"reject_add_request": rejectAddRequest,
+	})
+	return err
+}
+
+func (c *Client) SetGroupBan(groupID, userID int64, duration int64) error {
+	_, err := c.apiCall("set_group_ban", map[string]interface{}{
+		"group_id": groupID,
+		"user_id":  userID,
+		"duration": duration,
+	})
+	return err
+}
+
+func (c *Client) SetGroupWholeBan(groupID int64, enable bool) error {
+	_, err := c.apiCall("set_group_whole_ban", map[string]interface{}{
+		"group_id": groupID,
+		"enable":   enable,
+	})
+	return err
+}
+
+func (c *Client) SetGroupAdmin(groupID, userID int64, enable bool) error {
+	_, err := c.apiCall("set_group_admin", map[string]interface{}{
+		"group_id": groupID,
+		"user_id":  userID,
+		"enable":   enable,
+	})
+	return err
+}
+
+func (c *Client) SetGroupCard(groupID, userID int64, card string) error {
+	_, err := c.apiCall("set_group_card", map[string]interface{}{
+		"group_id": groupID,
+		"user_id":  userID,
+		"card":     card,
+	})
+	return err
+}
+
+func (c *Client) SetGroupName(groupID int64, groupName string) error {
+	_, err := c.apiCall("set_group_name", map[string]interface{}{
+		"group_id":   groupID,
+		"group_name": groupName,
+	})
+	return err
+}
+
+func (c *Client) SetGroupSpecialTitle(groupID, userID int64, specialTitle string, duration int64) error {
+	_, err := c.apiCall("set_group_special_title", map[string]interface{}{
+		"group_id":      groupID,
+		"user_id":       userID,
+		"special_title": specialTitle,
+		"duration":      duration,
+	})
+	return err
+}
+
+func (c *Client) SetGroupLeave(groupID int64, isDismiss bool) error {
+	_, err := c.apiCall("set_group_leave", map[string]interface{}{
+		"group_id":   groupID,
+		"is_dismiss": isDismiss,
+	})
+	return err
+}
+
+func (c *Client) GetStatus() (json.RawMessage, error) {
+	resp, err := c.apiCall("get_status", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetVersionInfo() (json.RawMessage, error) {
+	resp, err := c.apiCall("get_version_info", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) SetFriendAddRequest(flag string, approve bool, remark string) error {
+	_, err := c.apiCall("set_friend_add_request", map[string]interface{}{
+		"flag":    flag,
+		"approve": approve,
+		"remark":  remark,
+	})
+	return err
+}
+
+func (c *Client) SetGroupAddRequest(flag, subType string, approve bool, reason string) error {
+	_, err := c.apiCall("set_group_add_request", map[string]interface{}{
+		"flag":     flag,
+		"sub_type": subType,
+		"approve":  approve,
+		"reason":   reason,
+	})
+	return err
+}
+
+func (c *Client) GetLoginInfo() (json.RawMessage, error) {
+	resp, err := c.apiCall("get_login_info", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetStrangerInfo(userID int64, noCache bool) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_stranger_info", map[string]interface{}{
+		"user_id":  userID,
+		"no_cache": noCache,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetFriendList() (json.RawMessage, error) {
+	resp, err := c.apiCall("get_friend_list", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetGroupInfo(groupID int64, noCache bool) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_group_info", map[string]interface{}{
+		"group_id": groupID,
+		"no_cache": noCache,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetGroupList() (json.RawMessage, error) {
+	resp, err := c.apiCall("get_group_list", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetGroupMemberInfo(groupID, userID int64, noCache bool) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_group_member_info", map[string]interface{}{
+		"group_id": groupID,
+		"user_id":  userID,
+		"no_cache": noCache,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetGroupMemberList(groupID int64) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_group_member_list", map[string]interface{}{
+		"group_id": groupID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetGroupHonorInfo(groupID int64, honorType string) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_group_honor_info", map[string]interface{}{
+		"group_id": groupID,
+		"type":     honorType,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetCookies(domain string) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_cookies", map[string]interface{}{
+		"domain": domain,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetCSRFToken() (json.RawMessage, error) {
+	resp, err := c.apiCall("get_csrf_token", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetCredentials(domain string) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_credentials", map[string]interface{}{
+		"domain": domain,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetRecord(file, outFormat string) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_record", map[string]interface{}{
+		"file":       file,
+		"out_format": outFormat,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) GetImage(file string) (json.RawMessage, error) {
+	resp, err := c.apiCall("get_image", map[string]interface{}{
+		"file": file,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) CanSendImage() (json.RawMessage, error) {
+	resp, err := c.apiCall("can_send_image", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (c *Client) CanSendRecord() (json.RawMessage, error) {
+	resp, err := c.apiCall("can_send_record", nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}

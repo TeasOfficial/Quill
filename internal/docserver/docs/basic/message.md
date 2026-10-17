@@ -87,6 +87,46 @@ bot.send_group_msg(event.group_id, {
 })
 ```
 
+## 群管理
+
+```lua
+-- 踢人（reject_add_request 可选，默认 false，用于拒绝加群请求）
+bot.set_group_kick(group_id, user_id)
+bot.set_group_kick(group_id, user_id, true)
+
+-- 禁言（秒，0 = 解禁）
+bot.set_group_ban(group_id, user_id, 60)      -- 禁言 1 分钟
+bot.set_group_ban(group_id, user_id, 3600)    -- 禁言 1 小时
+bot.set_group_ban(group_id, user_id, 0)       -- 解禁
+
+-- 全员禁言
+bot.set_group_whole_ban(group_id, true)        -- 开启
+bot.set_group_whole_ban(group_id, false)       -- 关闭
+
+-- 管理员
+bot.set_group_admin(group_id, user_id, true)   -- 设为管理
+bot.set_group_admin(group_id, user_id, false)  -- 取消管理
+
+-- 群名片（群备注）
+bot.set_group_card(group_id, user_id, "警告：违规发言")
+
+-- 群名
+bot.set_group_name(group_id, "新群名")
+
+-- 专属头衔（-1 = 永久）
+bot.set_group_special_title(group_id, user_id, "VIP", -1)
+
+-- 退群（is_dismiss 可选，仅群主可解散）
+bot.set_group_leave(group_id)
+bot.set_group_leave(group_id, true)            -- 退群并解散
+
+-- 好友赞（次数默认 1）
+bot.send_like(user_id)
+bot.send_like(user_id, 10)
+```
+
+| **所有群管理 API 需要相应权限（群主/管理员），否则返回 error。** |
+
 ## 完整示例
 
 ```lua

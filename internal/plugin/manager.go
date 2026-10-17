@@ -1,7 +1,6 @@
 package plugin
 
 import (
-	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -13,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"quill/internal/logc"
+	"quill/internal/module"
 	"quill/internal/onebot"
 	"quill/internal/storage"
 
@@ -37,12 +38,22 @@ type Manager struct {
 	fileUnsafe bool
 	timers     []timerEntry
 	timerSeq   int64
+	logCh      chan logEntry
+	logDone    chan struct{}
+	memFS      map[string][]byte
+	memFSMu    sync.RWMutex
+}
+
+type logEntry struct {
+	level string
+	msg   string
+	time  time.Time
 }
 
 type timerEntry struct {
 	id       int64
 	deadline time.Time
-	fn       *lua.LTable
+	fn       lua.LValue
 }
 
 func NewManager(client *onebot.Client, db *storage.DB, fileUnsafe bool) *Manager {
@@ -56,7 +67,11 @@ func NewManager(client *onebot.Client, db *storage.DB, fileUnsafe bool) *Manager
 		registry:   registry,
 		db:         db,
 		fileUnsafe: fileUnsafe,
+		logCh:      make(chan logEntry, 256),
+		logDone:    make(chan struct{}),
+		memFS:      make(map[string][]byte),
 	}
+	go m.logWriter()
 	m.registerBotAPI()
 	return m
 }
@@ -64,7 +79,20 @@ func NewManager(client *onebot.Client, db *storage.DB, fileUnsafe bool) *Manager
 func (m *Manager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	close(m.logCh)
+	<-m.logDone
 	m.L.Close()
+}
+
+func (m *Manager) logWriter() {
+	defer close(m.logDone)
+	var buf strings.Builder
+	for entry := range m.logCh {
+		buf.Reset()
+		buf.WriteString(entry.time.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(&buf, " [%-5s] %s", entry.level, entry.msg)
+		fmt.Println(buf.String())
+	}
 }
 
 func (m *Manager) registerBotAPI() {
@@ -142,6 +170,324 @@ func (m *Manager) registerBotAPI() {
 	L.SetField(bot, "get_forward_msg", L.NewFunction(func(L *lua.LState) int {
 		fwdID := L.CheckString(1)
 		data, err := m.client.GetForwardMsg(fwdID)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+
+	L.SetField(bot, "send_like", L.NewFunction(func(L *lua.LState) int {
+		userID := L.CheckInt64(1)
+		times := 1
+		if L.GetTop() >= 2 {
+			times = L.CheckInt(2)
+		}
+		if err := m.client.SendLike(userID, times); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_kick", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		uid := L.CheckInt64(2)
+		reject := false
+		if L.GetTop() >= 3 {
+			reject = L.CheckBool(3)
+		}
+		if err := m.client.SetGroupKick(gid, uid, reject); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_ban", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		uid := L.CheckInt64(2)
+		duration := int64(L.CheckNumber(3))
+		if err := m.client.SetGroupBan(gid, uid, duration); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_whole_ban", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		enable := L.CheckBool(2)
+		if err := m.client.SetGroupWholeBan(gid, enable); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_admin", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		uid := L.CheckInt64(2)
+		enable := L.CheckBool(3)
+		if err := m.client.SetGroupAdmin(gid, uid, enable); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_card", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		uid := L.CheckInt64(2)
+		card := L.CheckString(3)
+		if err := m.client.SetGroupCard(gid, uid, card); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_name", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		name := L.CheckString(2)
+		if err := m.client.SetGroupName(gid, name); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_special_title", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		uid := L.CheckInt64(2)
+		title := L.CheckString(3)
+		duration := int64(L.CheckNumber(4))
+		if err := m.client.SetGroupSpecialTitle(gid, uid, title, duration); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_leave", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		isDismiss := false
+		if L.GetTop() >= 2 {
+			isDismiss = L.CheckBool(2)
+		}
+		if err := m.client.SetGroupLeave(gid, isDismiss); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "get_status", L.NewFunction(func(L *lua.LState) int {
+		data, err := m.client.GetStatus()
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+
+	L.SetField(bot, "get_version", L.NewFunction(func(L *lua.LState) int {
+		data, err := m.client.GetVersionInfo()
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+
+	L.SetField(bot, "set_friend_add_request", L.NewFunction(func(L *lua.LState) int {
+		flag := L.CheckString(1)
+		approve := L.CheckBool(2)
+		remark := ""
+		if L.GetTop() >= 3 {
+			remark = L.CheckString(3)
+		}
+		if err := m.client.SetFriendAddRequest(flag, approve, remark); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	L.SetField(bot, "set_group_add_request", L.NewFunction(func(L *lua.LState) int {
+		flag := L.CheckString(1)
+		subType := L.CheckString(2)
+		approve := L.CheckBool(3)
+		reason := ""
+		if L.GetTop() >= 4 {
+			reason = L.CheckString(4)
+		}
+		if err := m.client.SetGroupAddRequest(flag, subType, approve, reason); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+
+	queryAPI := func(name string, fn func() (json.RawMessage, error)) {
+		L.SetField(bot, name, L.NewFunction(func(L *lua.LState) int {
+			data, err := fn()
+			if err != nil {
+				L.Push(lua.LNil)
+				L.Push(lua.LString(err.Error()))
+				return 2
+			}
+			L.Push(lua.LString(string(data)))
+			return 1
+		}))
+	}
+	queryAPI("get_login_info", func() (json.RawMessage, error) { return m.client.GetLoginInfo() })
+	queryAPI("get_friend_list", func() (json.RawMessage, error) { return m.client.GetFriendList() })
+	queryAPI("get_group_list", func() (json.RawMessage, error) { return m.client.GetGroupList() })
+	queryAPI("get_csrf_token", func() (json.RawMessage, error) { return m.client.GetCSRFToken() })
+	queryAPI("can_send_image", func() (json.RawMessage, error) { return m.client.CanSendImage() })
+	queryAPI("can_send_record", func() (json.RawMessage, error) { return m.client.CanSendRecord() })
+
+	L.SetField(bot, "get_stranger_info", L.NewFunction(func(L *lua.LState) int {
+		uid := L.CheckInt64(1)
+		noCache := false
+		if L.GetTop() >= 2 {
+			noCache = L.CheckBool(2)
+		}
+		data, err := m.client.GetStrangerInfo(uid, noCache)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_group_info", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		noCache := false
+		if L.GetTop() >= 2 {
+			noCache = L.CheckBool(2)
+		}
+		data, err := m.client.GetGroupInfo(gid, noCache)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_group_member_info", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		uid := L.CheckInt64(2)
+		noCache := false
+		if L.GetTop() >= 3 {
+			noCache = L.CheckBool(3)
+		}
+		data, err := m.client.GetGroupMemberInfo(gid, uid, noCache)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_group_member_list", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		data, err := m.client.GetGroupMemberList(gid)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_group_honor_info", L.NewFunction(func(L *lua.LState) int {
+		gid := L.CheckInt64(1)
+		htype := "all"
+		if L.GetTop() >= 2 {
+			htype = L.CheckString(2)
+		}
+		data, err := m.client.GetGroupHonorInfo(gid, htype)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_cookies", L.NewFunction(func(L *lua.LState) int {
+		domain := L.CheckString(1)
+		data, err := m.client.GetCookies(domain)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_credentials", L.NewFunction(func(L *lua.LState) int {
+		domain := L.CheckString(1)
+		data, err := m.client.GetCredentials(domain)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_record", L.NewFunction(func(L *lua.LState) int {
+		file := L.CheckString(1)
+		outFmt := "mp3"
+		if L.GetTop() >= 2 {
+			outFmt = L.CheckString(2)
+		}
+		data, err := m.client.GetRecord(file, outFmt)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(string(data)))
+		return 1
+	}))
+	L.SetField(bot, "get_image", L.NewFunction(func(L *lua.LState) int {
+		file := L.CheckString(1)
+		data, err := m.client.GetImage(file)
 		if err != nil {
 			L.Push(lua.LNil)
 			L.Push(lua.LString(err.Error()))
@@ -411,6 +757,69 @@ func (m *Manager) registerBotAPI() {
 		L.Push(lua.LString(printLuaTable(tbl, 0)))
 		return 1
 	}))
+	L.SetField(util, "TableKeys", L.NewFunction(func(L *lua.LState) int {
+		tbl := L.CheckTable(1)
+		result := L.NewTable()
+		i := 1
+		tbl.ForEach(func(k, _ lua.LValue) {
+			result.RawSetInt(i, lua.LString(k.String()))
+			i++
+		})
+		L.Push(result)
+		return 1
+	}))
+	L.SetField(util, "TableLen", L.NewFunction(func(L *lua.LState) int {
+		tbl := L.CheckTable(1)
+		count := 0
+		tbl.ForEach(func(_, _ lua.LValue) {
+			count++
+		})
+		L.Push(lua.LNumber(count))
+		return 1
+	}))
+	L.SetField(util, "TableGet", L.NewFunction(func(L *lua.LState) int {
+		tbl := L.CheckTable(1)
+		path := L.CheckString(2)
+		L.Push(digTable(tbl, path))
+		return 1
+	}))
+	L.SetField(util, "DNSResolveALL", L.NewFunction(func(L *lua.LState) int {
+		domain := L.CheckString(1)
+		addrs, err := net.LookupHost(domain)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		var v4, v6 []string
+		for _, addr := range addrs {
+			if strings.Contains(addr, ":") {
+				v6 = append(v6, addr)
+			} else {
+				v4 = append(v4, addr)
+			}
+		}
+		tbl := L.NewTable()
+		if len(v4) > 0 {
+			tbl.RawSetInt(0, lua.LString(v4[0]))
+		}
+		if len(v6) > 0 {
+			tbl.RawSetInt(1, lua.LString(v6[0]))
+		}
+		L.Push(tbl)
+		return 1
+	}))
+	L.SetField(util, "DNSResolve", L.NewFunction(func(L *lua.LState) int {
+		domain := L.CheckString(1)
+		addrs, err := net.LookupHost(domain)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LString(addrs[0]))
+		return 1
+	}))
 	L.SetField(util, "CRC32", L.NewFunction(func(L *lua.LState) int {
 		data := L.CheckString(1)
 		crc := crc32.ChecksumIEEE([]byte(data))
@@ -550,7 +959,7 @@ func (m *Manager) registerBotAPI() {
 	}))
 	L.SetField(util, "After", L.NewFunction(func(L *lua.LState) int {
 		sec := L.CheckNumber(1)
-		fn := L.CheckTable(2)
+		fn := L.Get(2)
 		m.timerSeq++
 		m.timers = append(m.timers, timerEntry{
 			id:       m.timerSeq,
@@ -570,6 +979,119 @@ func (m *Manager) registerBotAPI() {
 		}
 		return 0
 	}))
+	L.SetField(util, "Log", L.NewFunction(func(L *lua.LState) int {
+		level := L.CheckString(1)
+		msg := L.CheckString(2)
+		select {
+		case m.logCh <- logEntry{level, msg, time.Now()}:
+		default:
+		}
+		return 0
+	}))
+
+	memFS := L.NewTable()
+	L.SetField(memFS, "Write", L.NewFunction(func(L *lua.LState) int {
+		name := L.CheckString(1)
+		data := L.CheckString(2)
+		m.memFSMu.Lock()
+		m.memFS[name] = []byte(data)
+		m.memFSMu.Unlock()
+		L.Push(lua.LTrue)
+		return 1
+	}))
+	L.SetField(memFS, "Read", L.NewFunction(func(L *lua.LState) int {
+		name := L.CheckString(1)
+		m.memFSMu.RLock()
+		data, ok := m.memFS[name]
+		m.memFSMu.RUnlock()
+		if !ok {
+			L.Push(lua.LNil)
+		} else {
+			L.Push(lua.LString(string(data)))
+		}
+		return 1
+	}))
+	L.SetField(memFS, "Delete", L.NewFunction(func(L *lua.LState) int {
+		m.memFSMu.Lock()
+		delete(m.memFS, L.CheckString(1))
+		m.memFSMu.Unlock()
+		return 0
+	}))
+	L.SetField(memFS, "Exists", L.NewFunction(func(L *lua.LState) int {
+		m.memFSMu.RLock()
+		_, ok := m.memFS[L.CheckString(1)]
+		m.memFSMu.RUnlock()
+		L.Push(lua.LBool(ok))
+		return 1
+	}))
+	L.SetField(memFS, "List", L.NewFunction(func(L *lua.LState) int {
+		m.memFSMu.RLock()
+		tbl := L.NewTable()
+		i := 1
+		for k := range m.memFS {
+			tbl.RawSetInt(i, lua.LString(k))
+			i++
+		}
+		m.memFSMu.RUnlock()
+		L.Push(tbl)
+		return 1
+	}))
+	L.SetField(memFS, "Clear", L.NewFunction(func(L *lua.LState) int {
+		m.memFSMu.Lock()
+		m.memFS = make(map[string][]byte)
+		m.memFSMu.Unlock()
+		return 0
+	}))
+	L.SetField(memFS, "Dump", L.NewFunction(func(L *lua.LState) int {
+		name := L.CheckString(1)
+		path := L.CheckString(2)
+		m.memFSMu.RLock()
+		data, ok := m.memFS[name]
+		m.memFSMu.RUnlock()
+		if !ok {
+			L.Push(lua.LNil)
+			L.Push(lua.LString("not found in MemFS"))
+			return 2
+		}
+		safePath, err := safeDataPath(path)
+		if err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		os.MkdirAll(filepath.Dir(safePath), 0755)
+		if err := os.WriteFile(safePath, data, 0644); err != nil {
+			L.Push(lua.LBool(false))
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		L.Push(lua.LTrue)
+		return 1
+	}))
+	L.SetField(memFS, "Load", L.NewFunction(func(L *lua.LState) int {
+		path := L.CheckString(1)
+		safePath, err := safeDataPath(path)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		data, err := os.ReadFile(safePath)
+		if err != nil {
+			L.Push(lua.LNil)
+			L.Push(lua.LString(err.Error()))
+			return 2
+		}
+		m.memFSMu.Lock()
+		m.memFS[filepath.Base(path)] = data
+		m.memFSMu.Unlock()
+		L.Push(lua.LString(filepath.Base(path)))
+		return 1
+	}))
+	L.SetField(util, "MemFS", memFS)
+
+	module.RegisterModuleUtil(L, util)
+
 	L.SetGlobal("util", util)
 
 	L.SetGlobal("bot", bot)
@@ -618,6 +1140,22 @@ func resolveSafe(rel, root string) (string, error) {
 	return abs, nil
 }
 
+func digTable(t *lua.LTable, path string) lua.LValue {
+	parts := strings.Split(path, ".")
+	for _, p := range parts {
+		if t == nil {
+			return lua.LNil
+		}
+		v := t.RawGetString(p)
+		next, ok := v.(*lua.LTable)
+		if !ok {
+			return v
+		}
+		t = next
+	}
+	return t
+}
+
 func luaValueToMsg(v lua.LValue) interface{} {
 	switch val := v.(type) {
 	case lua.LString:
@@ -659,15 +1197,77 @@ func luaValueToSimple(v lua.LValue) interface{} {
 		return float64(val)
 	case lua.LBool:
 		return bool(val)
+	case *lua.LTable:
+		return luaTableToSimpleValue(val)
 	default:
 		return v.String()
 	}
 }
 
+func luaTableToSimpleValue(tbl *lua.LTable) interface{} {
+	maxIdx := tbl.Len()
+	if maxIdx > 0 {
+		arr := make([]interface{}, 0, maxIdx)
+		tbl.ForEach(func(k, v lua.LValue) {
+			if kn, ok := k.(lua.LNumber); ok {
+				idx := int(kn)
+				if idx >= 1 && idx <= maxIdx {
+					for len(arr) < idx {
+						arr = append(arr, nil)
+					}
+					arr[idx-1] = luaValueToSimple(v)
+				}
+			}
+		})
+		return arr
+	}
+	m := make(map[string]interface{})
+	tbl.ForEach(func(k, v lua.LValue) {
+		m[k.String()] = luaValueToSimple(v)
+	})
+	return m
+}
+
 func (m *Manager) LoadPlugins(dir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.doLoadPlugins(dir)
+}
 
+func (m *Manager) UnloadPlugins() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.doUnloadPlugins()
+}
+
+func (m *Manager) doUnloadPlugins() {
+	m.registry = m.L.NewTable()
+	m.L.SetGlobal("__plugin_registry", m.registry)
+	logc.Fmt("\u2715", logc.Gray, "\u5df2\u5378\u8f7d\u5168\u90e8\u63d2\u4ef6")
+}
+
+func (m *Manager) ReloadPlugins(dir string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.doUnloadPlugins()
+	return m.doLoadPlugins(dir)
+}
+
+// underInitDir reports whether dirPath is at or below a directory that contains
+// an init.lua. Files inside a directory plugin are loaded through include() and
+// must not be registered as standalone plugins.
+func underInitDir(dirPath, root string, initDirs map[string]bool) bool {
+	for d := dirPath; ; d = filepath.Dir(d) {
+		if initDirs[d] {
+			return true
+		}
+		if d == root || len(d) <= len(root) {
+			return false
+		}
+	}
+}
+
+func (m *Manager) doLoadPlugins(dir string) error {
 	dir, _ = filepath.Abs(dir)
 
 	initDirs := make(map[string]bool)
@@ -698,7 +1298,13 @@ func (m *Manager) LoadPlugins(dir string) error {
 		prevDir := L.GetGlobal("__plugin_dir")
 		L.SetGlobal("__plugin_dir", lua.LString(filepath.Dir(targetPath)))
 
-		if err := L.DoFile(targetPath); err != nil {
+		source, err := os.ReadFile(targetPath)
+		if err != nil {
+			L.RaiseError("include %s: %v", target, err)
+			return 0
+		}
+		source = preprocessLua(source)
+		if err := L.DoString(string(source)); err != nil {
 			L.RaiseError("include %s: %v", target, err)
 			return 0
 		}
@@ -715,8 +1321,7 @@ func (m *Manager) LoadPlugins(dir string) error {
 			return nil
 		}
 
-		parentDir := filepath.Dir(path)
-		if initDirs[parentDir] && info.Name() != "init.lua" {
+		if info.Name() != "init.lua" && underInitDir(filepath.Dir(path), dir, initDirs) {
 			return nil // loaded by init.lua via include()
 		}
 
@@ -729,42 +1334,105 @@ func (m *Manager) LoadPlugins(dir string) error {
 func (m *Manager) doPluginFile(baseDir, path string) error {
 	m.L.SetGlobal("__plugin_dir", lua.LString(filepath.Dir(path)))
 
-	if err := m.L.DoFile(path); err != nil {
+	source, err := os.ReadFile(path)
+	if err != nil {
+		logc.Fmt("!", logc.Yellow, "插件读取失败 %s: %v", path, err)
+		return nil
+	}
+	source = preprocessLua(source)
+
+	if err := m.L.DoString(string(source)); err != nil {
 		logc.Fmt("!", logc.Yellow, "插件加载失败 %s: %v", path, err)
 		return nil
 	}
 
 	rel, _ := filepath.Rel(baseDir, path)
-	pluginName := strings.TrimSuffix(rel, ".lua")
-	pluginName = strings.ReplaceAll(pluginName, string(filepath.Separator), "/")
+	fileName := strings.TrimSuffix(rel, ".lua")
+	fileName = strings.ReplaceAll(fileName, string(filepath.Separator), "/")
 
 	pluginTable := m.L.Get(-1)
 
-	if tbl, ok := pluginTable.(*lua.LTable); ok {
-		m.registry.RawSetString(pluginName, tbl)
-		logc.Fmt("◆", logc.Magenta, "已加载插件: %s", pluginName)
-	} else {
-		logc.Fmt("!", logc.Gray, "跳过 %s (未返回 table)", pluginName)
+	tbl, ok := pluginTable.(*lua.LTable)
+	if !ok {
+		logc.Fmt("!", logc.Gray, "跳过 %s (未返回 table)", fileName)
+		m.L.Pop(1)
+		return nil
 	}
-	m.L.Pop(1)
 
+	info := tbl.RawGetString("PluginInfo")
+	if info == lua.LNil {
+		logc.Fmt("!", logc.Red, "加载失败 %s: 缺少 PluginInfo", fileName)
+		m.L.Pop(1)
+		return nil
+	}
+
+	infoTbl, ok := info.(*lua.LTable)
+	if !ok {
+		logc.Fmt("!", logc.Red, "加载失败 %s: PluginInfo 不是 table", fileName)
+		m.L.Pop(1)
+		return nil
+	}
+
+	pName := stringOf(infoTbl.RawGetString("name"))
+	pVer := stringOf(infoTbl.RawGetString("version"))
+	if pName == "" || pVer == "" {
+		logc.Fmt("!", logc.Red, "加载失败 %s: PluginInfo 缺少 name 或 version", fileName)
+		m.L.Pop(1)
+		return nil
+	}
+
+	pAuthor := stringOf(infoTbl.RawGetString("author"))
+	pUpdate := stringOf(infoTbl.RawGetString("update_url"))
+	_ = pUpdate
+
+	displayName := pName
+	if pVer != "" {
+		displayName += " v" + pVer
+	}
+	extra := ""
+	if pAuthor != "" {
+		extra += " @" + pAuthor
+	}
+	if extra == "" {
+		extra = fileName
+	} else {
+		extra += " (" + fileName + ")"
+	}
+
+	m.registry.RawSetString(displayName, tbl)
+	logc.Fmt("\u25C6", logc.Magenta, "已加载插件: %s %s", displayName, extra)
+	m.L.Pop(1)
 	return nil
+}
+
+func preprocessLua(src []byte) []byte {
+	s := string(src)
+	s = strings.ReplaceAll(s, "!=", "~=")
+	s = strings.ReplaceAll(s, "||", " or ")
+	s = strings.ReplaceAll(s, "&&", " and ")
+	s = strings.ReplaceAll(s, "!", "not ")
+	return []byte(s)
+}
+
+func stringOf(v lua.LValue) string {
+	if v == lua.LNil {
+		return ""
+	}
+	if s, ok := v.(lua.LString); ok {
+		return string(s)
+	}
+	return v.String()
 }
 
 func (m *Manager) Dispatch(event *onebot.Event) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	m.L.SetContext(ctx)
-	defer m.L.RemoveContext()
-
-	L := m.L
-	m.processTimers(L)
-	eventTbl := eventToTable(L, event)
+	m.processTimers(m.L)
+	eventTbl := eventToTable(m.L, event)
 
 	handlerKey, fallbackKey := routeEvent(event)
+	L := m.L
 
 	m.registry.ForEach(func(name, plugin lua.LValue) {
 		tbl, ok := plugin.(*lua.LTable)
@@ -959,21 +1627,35 @@ func printLuaTable(tbl *lua.LTable, depth int) string {
 	indent := strings.Repeat("  ", depth)
 	childIndent := strings.Repeat("  ", depth+1)
 
+	const maxEntries = 32
 	var parts []string
+	count := 0
 	seen := make(map[string]bool)
 
 	tbl.ForEach(func(k, v lua.LValue) {
+		if count >= maxEntries {
+			return
+		}
 		key := k.String()
 		if seen[key] {
 			return
 		}
 		seen[key] = true
+		count++
 
 		var valStr string
 		if sub, ok := v.(*lua.LTable); ok {
-			valStr = "\n" + printLuaTable(sub, depth+1)
+			if sub == tbl {
+				valStr = "<self>"
+			} else {
+				valStr = "\n" + printLuaTable(sub, depth+1)
+			}
 		} else {
-			valStr = fmt.Sprint(v)
+			s := fmt.Sprint(v)
+			if len(s) > 200 {
+				s = s[:200] + "..."
+			}
+			valStr = s
 		}
 
 		if n, ok := k.(lua.LNumber); ok && float64(n) == float64(int64(n)) {
@@ -983,10 +1665,14 @@ func printLuaTable(tbl *lua.LTable, depth int) string {
 		}
 	})
 
-	if len(parts) == 0 {
-		return indent + "{}"
+	result := indent + "{\n" + strings.Join(parts, ",\n") + "\n" + indent + "}"
+	if len(result) > 8192 {
+		result = result[:8192] + "\n... (truncated)"
 	}
-	return indent + "{\n" + strings.Join(parts, ",\n") + "\n" + indent + "}"
+	if count == maxEntries {
+		result += "\n... (max entries)"
+	}
+	return result
 }
 
 func aesEncrypt(plain, key string) (string, error) {

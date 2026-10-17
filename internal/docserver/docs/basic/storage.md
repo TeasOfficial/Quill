@@ -117,7 +117,7 @@ Bot 提供受限的文件读写 API，所有操作限定在 `data/` 目录内。
 
 ```lua
 -- 下载文件后写入
-local http = module("http")
+local resp = util.http_get("https://api.example.com")
 local resp = http.get("https://api.example.com/data.json")
 bot.file.write("cache/api_data.json", resp)
 

@@ -7,10 +7,10 @@ import (
 	"syscall"
 	"time"
 
+	"quill/internal/command"
 	"quill/internal/config"
 	"quill/internal/docserver"
 	"quill/internal/logc"
-	"quill/internal/module"
 	"quill/internal/onebot"
 	"quill/internal/plugin"
 	"quill/internal/storage"
@@ -28,38 +28,27 @@ func main() {
 	fmt.Println(logc.Dim(fmt.Sprintf("           v0.1.0-dev  build %s", time.Now().Format("2006-01-02"))))
 	fmt.Println()
 	logc.Fmt("\u2660", logc.Cyan, "Quill \u542f\u52a8\u4e2d...")
-	logc.Fmt("→", logc.Gray, "HTTP: %s  WS: %s  mode: %s", cfg.BaseURL, cfg.WSURL, cfg.WSMode)
+	logc.Fmt("\u2192", logc.Gray, "HTTP: %s  WS: %s  mode: %s", cfg.BaseURL, cfg.WSURL, cfg.WSMode)
 
 	client := onebot.NewClient(cfg.BaseURL, cfg.Token)
 
 	db, err := storage.New("data")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", logc.Red("错误: 创建数据目录失败: "+err.Error()))
+		fmt.Fprintf(os.Stderr, "%s\n", logc.Red("\u9519\u8bef: \u521b\u5efa\u6570\u636e\u76ee\u5f55\u5931\u8d25: "+err.Error()))
 		os.Exit(1)
 	}
-
-	modHost := module.NewHost()
-	defer modHost.Close()
 
 	mgr := plugin.NewManager(client, db, cfg.FileUnsafe)
 	defer mgr.Close()
 
-	module.RegisterLuaAPI(mgr.L, modHost)
-
 	if err := mgr.LoadPlugins("plugins"); err != nil {
-		logc.Fmt("!", logc.Yellow, "插件加载警告: %v", err)
+		logc.Fmt("!", logc.Yellow, "\u63d2\u4ef6\u52a0\u8f7d\u8b66\u544a: %v", err)
 	}
-
-	builder := module.NewBuilder(modHost, "modules")
-	builder.BuildAll()
-	if err := builder.Start(); err != nil {
-		logc.Fmt("!", logc.Yellow, "模块监听启动失败: %v", err)
-	}
-	defer builder.Close()
 
 	receiver := onebot.NewReceiver()
 	receiver.OnEvent = func(e *onebot.Event) {
 		if e.PostType == "meta_event" {
+			mgr.Dispatch(e)
 			return
 		}
 		switch {
@@ -77,12 +66,12 @@ func main() {
 		mgr.Dispatch(e)
 	}
 	receiver.OnConnect = func() {
-		logc.Fmt("✓", logc.Green, "已连接 OneBot")
+		logc.Fmt("\u2713", logc.Green, "\u5df2\u8fde\u63a5 OneBot")
 	}
 
 	go func() {
 		if err := docserver.Serve(":3081"); err != nil {
-			logc.Fmt("!", logc.Yellow, "文档服务: %v", err)
+			logc.Fmt("!", logc.Yellow, "\u6587\u6863\u670d\u52a1: %v", err)
 		}
 	}()
 
@@ -93,7 +82,7 @@ func main() {
 	case "reverse":
 		go func() {
 			if err := receiver.Serve(cfg.WSListen, cfg.WSPath, cfg.Token); err != nil {
-				fmt.Fprintf(os.Stderr, "%s\n", logc.Red("错误: "+err.Error()))
+				fmt.Fprintf(os.Stderr, "%s\n", logc.Red("\u9519\u8bef: "+err.Error()))
 				os.Exit(1)
 			}
 		}()
@@ -101,24 +90,35 @@ func main() {
 		go func() {
 			for {
 				if err := receiver.Connect(cfg.WSURL, cfg.Token, cfg.WSPath); err != nil {
-					logc.Fmt("↻", logc.Yellow, "WS 连接失败，5秒后重试...")
+					logc.Fmt("\u21bb", logc.Yellow, "WS \u8fde\u63a5\u5931\u8d25\uff0c5\u79d2\u540e\u91cd\u8bd5...")
 					time.Sleep(5 * time.Second)
 					continue
 				}
 				receiver.Listen()
-				logc.Fmt("↻", logc.Yellow, "WS 断开，5秒后重连...")
+				logc.Fmt("\u21bb", logc.Yellow, "WS \u65ad\u5f00\uff0c5\u79d2\u540e\u91cd\u8fde...")
 				time.Sleep(5 * time.Second)
 			}
 		}()
 	default:
-		fmt.Fprintf(os.Stderr, "%s\n", logc.Red("错误: 未知 WS 模式 "+cfg.WSMode))
+		fmt.Fprintf(os.Stderr, "%s\n", logc.Red("\u9519\u8bef: \u672a\u77e5 WS \u6a21\u5f0f "+cfg.WSMode))
 		os.Exit(1)
 	}
 
-	logc.Fmt("☰", logc.Cyan, "运行中，Ctrl+C 退出")
+	cmdSystem := command.New()
+	cmdSystem.Register("reload", func(args []string) {
+		fmt.Println()
+		logc.Fmt("\u21bb", logc.Cyan, "\u6b63\u5728\u91cd\u8f7d\u5168\u90e8\u63d2\u4ef6...")
+		if err := mgr.ReloadPlugins("plugins"); err != nil {
+			logc.Fmt("!", logc.Red, "\u63d2\u4ef6\u91cd\u8f7d\u5931\u8d25: %v", err)
+		}
+		logc.Fmt("\u2713", logc.Green, "\u63d2\u4ef6\u91cd\u8f7d\u5b8c\u6210")
+	})
+	cmdSystem.Run()
+
+	logc.Fmt("\u2630", logc.Cyan, "\u8fd0\u884c\u4e2d\uff0cCtrl+C \u9000\u51fa")
 	<-quit
 	fmt.Println()
-	logc.Fmt("✕", logc.Gray, "正在关闭...")
+	logc.Fmt("\u2715", logc.Gray, "\u6b63\u5728\u5173\u95ed...")
 }
 
 func trunc(s string, max int) string {

@@ -1,5 +1,5 @@
 # ============================================
-# Quill — Go + Lua + WASM QQ Bot
+# Quill — Go 宿主 + Lua 插件的 QQ 机器人
 # ============================================
 
 # Binary
@@ -12,9 +12,6 @@
 # Test
 *.test
 *.out
-
-# WASM build artifacts (compiled from modules/*/main.go)
-*.wasm
 
 # Build output
 release/

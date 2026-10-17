@@ -14,13 +14,20 @@ ONEBOT_WS_MODE=forward
 
 在 `plugins/` 目录下新建 `hello.lua`：
 ```lua
-return {
-    on_group_message = function(event)
-        if event.raw_message == "你好" then
-            bot.send_group_msg(event.group_id, "你也好呀~")
-        end
-    end,
+local Quill = {}
+
+Quill.PluginInfo = {
+    name = "hello",
+    version = "1.0.0",
 }
+
+Quill.on_group_message = function(event)
+    if event.raw_message == "你好" then
+        bot.send_group_msg(event.group_id, "你也好呀~")
+    end
+end
+
+return Quill
 ```
 
 ### 3. 运行
@@ -65,6 +72,8 @@ bot.send_private_msg(QQ号, "内容")
 ```
 
 ## 下一步
+- [bot API 参考](bot_api) — 完整 API 文档（消息、群管理、文件、存储）
+- [util API 参考](util_api) — 工具函数文档（JSON、加密、哈希、定时器）
 - [消息发送](message) — 文字、图片、语音、回复、合并转发
-- [插件开发](plugin) — 事件类型、util 工具集、WASM 模块调用
+- [插件开发](plugin) — 事件类型、目录插件、内置函数
 - [数据存储](storage) — bot.db 持久化 + bot.file 文件 I/O

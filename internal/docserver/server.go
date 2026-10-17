@@ -1,4 +1,4 @@
-﻿package docserver
+package docserver
 
 import (
 	"bytes"
@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 
 	"quill/internal/logc"
 
@@ -22,24 +21,6 @@ var DocsFS embed.FS
 var md = goldmark.New(
 	goldmark.WithExtensions(extension.Table),
 )
-
-var (
-	dynamicPages   = make(map[string]string)
-	dynamicPagesMu sync.RWMutex
-)
-
-func RegisterPage(path, content string) {
-	dynamicPagesMu.Lock()
-	dynamicPages[path] = content
-	dynamicPagesMu.Unlock()
-	logc.Fmt("\u2637", logc.Gray, "Wiki: \u6ce8\u518c\u6a21\u5757\u9875 /%s", path)
-}
-
-func UnregisterPage(path string) {
-	dynamicPagesMu.Lock()
-	delete(dynamicPages, path)
-	dynamicPagesMu.Unlock()
-}
 
 type Page struct {
 	Title    string
@@ -87,20 +68,8 @@ func servePage(w http.ResponseWriter, r *http.Request) {
 
 	sections := listSections()
 
-	var content []byte
-	var err error
-
-	dynamicPagesMu.RLock()
-	mdText, isDynamic := dynamicPages[path+".md"]
-	dynamicPagesMu.RUnlock()
-
-	if isDynamic {
-		content = []byte(mdText)
-	} else {
-		content, err = DocsFS.ReadFile("docs/" + path + ".md")
-	}
-
-	if err != nil || (content == nil && !isDynamic) {
+	content, err := DocsFS.ReadFile("docs/" + path + ".md")
+	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		fmt.Fprintf(w, "Page not found: %s", path)
 		return
@@ -164,30 +133,6 @@ func listSections() []NavSection {
 			Pages: pages,
 		})
 	}
-
-	dynamicPagesMu.RLock()
-	if len(dynamicPages) > 0 {
-		var modulePages []NavLink
-		for path, content := range dynamicPages {
-			pageTitle := extractH1(content)
-			if pageTitle == "" {
-				pageTitle = strings.TrimSuffix(path, ".md")
-			}
-			modulePages = append(modulePages, NavLink{
-				Title: pageTitle,
-				Href:  "/" + strings.TrimSuffix(path, ".md"),
-			})
-		}
-		sort.Slice(modulePages, func(i, j int) bool {
-			return modulePages[i].Title < modulePages[j].Title
-		})
-		sections = append(sections, NavSection{
-			Name:  "\u6a21\u5757",
-			Title: "\u6a21\u5757\u6587\u6863",
-			Pages: modulePages,
-		})
-	}
-	dynamicPagesMu.RUnlock()
 
 	return sections
 }
