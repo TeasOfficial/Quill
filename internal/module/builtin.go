@@ -65,9 +65,11 @@ var (
 )
 
 func newDlTask(url, path string) *dlTask {
-	dlSeq++
+	cleanupDlTasks()
+
 	dlTasksMu.Lock()
 	defer dlTasksMu.Unlock()
+	dlSeq++
 	t := &dlTask{
 		ID:        fmt.Sprintf("%d", dlSeq),
 		URL:       url,
@@ -77,6 +79,21 @@ func newDlTask(url, path string) *dlTask {
 	}
 	dlTasks[t.ID] = t
 	return t
+}
+
+// cleanupDlTasks 清理已完成超过 5 分钟的任务，避免 map 无限增长。
+func cleanupDlTasks() {
+	now := time.Now()
+	dlTasksMu.Lock()
+	defer dlTasksMu.Unlock()
+	for id, t := range dlTasks {
+		t.mu.Lock()
+		done := t.Done
+		t.mu.Unlock()
+		if done && now.Sub(t.StartTime) > 5*time.Minute {
+			delete(dlTasks, id)
+		}
+	}
 }
 
 func (t *dlTask) setError(err string) {
@@ -124,6 +141,8 @@ func RegisterModuleUtil(L *lua.LState, utilTbl *lua.LTable) {
 	utilTbl.RawSetString("download_poll", L.NewFunction(builtinDownloadPoll))
 	utilTbl.RawSetString("download_list", L.NewFunction(builtinDownloadList))
 	utilTbl.RawSetString("extract_archive", L.NewFunction(builtinExtractArchive))
+	utilTbl.RawSetString("extract_async", L.NewFunction(builtinExtractAsync))
+	utilTbl.RawSetString("extract_poll", L.NewFunction(builtinExtractPoll))
 }
 
 func builtinHTTPGet(L *lua.LState) int {
@@ -263,6 +282,110 @@ func builtinExtractArchive(L *lua.LState) int {
 	return 1
 }
 
+// ── 异步解压 ─────────────────────────────────────
+// 同步解压会长时间占用 Lua 锁，大压缩包请用 extract_async + extract_poll。
+
+type extractTask struct {
+	ID    string
+	File  string
+	Dest  string
+	Start time.Time
+
+	mu    sync.Mutex
+	Done  bool
+	Count int
+	Err   string
+}
+
+var (
+	extractTasks   = make(map[string]*extractTask)
+	extractTasksMu sync.RWMutex
+	extractSeq     int64
+)
+
+func newExtractTask(file, dest string) *extractTask {
+	cleanupExtractTasks()
+
+	extractTasksMu.Lock()
+	defer extractTasksMu.Unlock()
+	extractSeq++
+	t := &extractTask{
+		ID:    fmt.Sprintf("%d", extractSeq),
+		File:  file,
+		Dest:  dest,
+		Start: time.Now(),
+	}
+	extractTasks[t.ID] = t
+	return t
+}
+
+func cleanupExtractTasks() {
+	now := time.Now()
+	extractTasksMu.Lock()
+	defer extractTasksMu.Unlock()
+	for id, t := range extractTasks {
+		t.mu.Lock()
+		done := t.Done
+		t.mu.Unlock()
+		if done && now.Sub(t.Start) > 5*time.Minute {
+			delete(extractTasks, id)
+		}
+	}
+}
+
+func builtinExtractAsync(L *lua.LState) int {
+	file := L.CheckString(1)
+	dest := L.CheckString(2)
+	os.MkdirAll(dest, 0755)
+
+	task := newExtractTask(file, dest)
+	go func() {
+		count, err := extractArchive(file, dest)
+		task.mu.Lock()
+		task.Done = true
+		task.Count = count
+		if err != nil {
+			task.Err = err.Error()
+		}
+		task.mu.Unlock()
+	}()
+
+	L.Push(lua.LString(task.ID))
+	return 1
+}
+
+func builtinExtractPoll(L *lua.LState) int {
+	id := L.CheckString(1)
+
+	extractTasksMu.RLock()
+	t, ok := extractTasks[id]
+	extractTasksMu.RUnlock()
+	if !ok {
+		L.Push(lua.LNil)
+		return 1
+	}
+
+	t.mu.Lock()
+	done := t.Done
+	count := t.Count
+	errStr := t.Err
+	elapsed := time.Since(t.Start).Seconds()
+	t.mu.Unlock()
+
+	tbl := L.NewTable()
+	tbl.RawSetString("id", lua.LString(t.ID))
+	tbl.RawSetString("file", lua.LString(t.File))
+	tbl.RawSetString("dest", lua.LString(t.Dest))
+	tbl.RawSetString("done", lua.LBool(done))
+	tbl.RawSetString("count", lua.LNumber(count))
+	tbl.RawSetString("elapsed", lua.LNumber(elapsed))
+	if errStr != "" {
+		tbl.RawSetString("error", lua.LString(errStr))
+	}
+	L.Push(tbl)
+	return 1
+}
+
 func builtinDownloadList(L *lua.LState) int {
 	dlTasksMu.RLock()
 	defer dlTasksMu.RUnlock()
@@ -307,14 +430,6 @@ func builtinDownloadList(L *lua.LState) int {
 	}
 	L.Push(tbl)
 	return 1
-}
-
-type httpRequest struct {
-	Method  string            `json:"method"`
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    string            `json:"body,omitempty"`
-	Timeout int               `json:"timeout,omitempty"`
 }
 
 type httpResponse struct {

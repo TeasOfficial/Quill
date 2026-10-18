@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"quill/internal/database"
 	"quill/internal/onebot"
 	"quill/internal/storage"
 	"strings"
@@ -351,5 +352,117 @@ return {
 	}
 	if err := m.L.DoString(`AFTER_TIMEOUT = 1`); err != nil {
 		t.Fatalf("lua state unusable after timeout: %v", err)
+	}
+}
+
+// 队列满时必须丢弃而不是阻塞调用方（接收协程绝不能卡住）。
+func TestEnqueueDropsInsteadOfBlocking(t *testing.T) {
+	m := newTestManager(t) // 不 Start，没有消费者
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < eventQueueSize+50; i++ {
+			m.Enqueue(&onebot.Event{PostType: "message", MessageType: "group"})
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Enqueue blocked when the queue was full")
+	}
+	if m.dropped.Load() == 0 {
+		t.Fatal("expected dropped events to be counted")
+	}
+}
+
+// Close 必须能中断正在执行的 handler，而不是无限等待锁。
+func TestCloseCancelsRunningHandler(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "slow.lua"), []byte(`
+return {
+    PluginInfo = { name = "slow", version = "1.0.0" },
+    on_group_message = function(event) util.Sleep(30) end,
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(nil, nil, false)
+	if err := m.LoadPlugins(dir); err != nil {
+		t.Fatal(err)
+	}
+	m.Start()
+	m.Enqueue(&onebot.Event{PostType: "message", MessageType: "group"})
+	time.Sleep(150 * time.Millisecond) // 让 handler 进入 Sleep
+
+	start := time.Now()
+	m.Close()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Close blocked for %v", elapsed)
+	}
+}
+
+// 多个插件共享同一个 5 秒事件预算，而不是各自 5 秒。
+func TestEventDispatchSharesOneBudget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		src := "return {\n" +
+			"    PluginInfo = { name = \"" + name + "\", version = \"1.0.0\" },\n" +
+			"    on_group_message = function(event) util.Sleep(4) end,\n" +
+			"}\n"
+		if err := os.WriteFile(filepath.Join(dir, name+".lua"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := newTestManager(t)
+	if err := m.LoadPlugins(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	m.Dispatch(&onebot.Event{PostType: "message", MessageType: "group"})
+	elapsed := time.Since(start)
+
+	if elapsed > 7*time.Second {
+		t.Fatalf("two plugins should share one 5s budget, took %v", elapsed)
+	}
+	if elapsed < pluginTimeout {
+		t.Fatalf("dispatch returned too early: %v", elapsed)
+	}
+}
+
+// 配置 SQL 后，bot.sql 应能在插件里直接使用。
+func TestBotSQLAvailableInLua(t *testing.T) {
+	dir := t.TempDir()
+
+	sqldb, err := database.Open("sqlite", filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	m := NewManager(nil, nil, false)
+	defer m.Close()
+	m.AttachSQL(sqldb)
+
+	fn, err := m.L.Load(strings.NewReader(`
+		assert(bot.sql ~= nil, "bot.sql missing")
+		bot.sql.exec("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
+		bot.sql.exec("INSERT INTO kv (k, v) VALUES (?, ?)", {"a", "1"})
+		local row = bot.sql.query_row("SELECT v FROM kv WHERE k = ?", {"a"})
+		assert(row and row.v == "1", "query failed")
+	`), "sql_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.L.Push(fn)
+	if err := m.L.PCall(0, lua.MultRet, nil); err != nil {
+		t.Fatalf("lua: %v", err)
 	}
 }

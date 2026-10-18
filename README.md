@@ -49,9 +49,9 @@
 |------|------|
 | 消息 | 纯文本、图片、语音、视频、AT、回复、合并转发、自定义消息段 |
 | 事件 | 群消息、私聊、入群、退群、禁言、群文件上传、管理变更、撤回、戳一戳、好友添加、精华消息、好友/群请求、心跳 |
-| 插件 | 嵌套目录、`init.lua` 入口、`include()` 模块化、多事件处理、控制台 `/reload` 热重载 |
+| 插件 | 嵌套目录、`init.lua` 入口、`include()` 模块化、多事件处理、控制台 `reload` 热重载 |
 | 网络 | `util.http_get/post/request`、多线程分段下载、zip/tar/gz/bz2 解压，全部内置 |
-| 存储 | `bot.db` 键值持久化、`bot.file` 文件 I/O、`util.MemFS` 内存键值 |
+| 存储 | `bot.db` 键值持久化、`bot.sql`（SQLite / MySQL）、`bot.file` 文件 I/O、`util.MemFS` 内存键值 |
 | 连接 | 正向 WS 客户端 / 反向 WS 服务端 + HTTP 事件上报 |
 | 体验 | 彩色终端日志、`NO_COLOR` 降级、内嵌 Wiki（普通/专业双模式） |
 
@@ -147,6 +147,21 @@ data.score = data.score + 10
 db.set("game/" .. event.user_id, data)
 ```
 
+**SQL 数据库** — 配置 `ONEBOT_SQL_DRIVER=sqlite`（或 `mysql`）后可用：
+
+```lua
+bot.sql.exec([[
+    CREATE TABLE IF NOT EXISTS points (
+        qq INTEGER PRIMARY KEY,
+        score INTEGER NOT NULL DEFAULT 0
+    )
+]])
+
+bot.sql.exec("INSERT INTO points (qq, score) VALUES (?, ?)", { event.user_id, 0 })
+local row = bot.sql.query_row("SELECT score FROM points WHERE qq = ?", { event.user_id })
+bot.send_group_msg(event.group_id, "当前积分: " .. (row and row.score or 0))
+```
+
 ### 目录结构
 
 ```
@@ -157,6 +172,7 @@ db.set("game/" .. event.user_id, data)
  │   ├── plugin/             # Lua 引擎、bot/util API、事件分发、定时器
  │   ├── module/             # 内置 HTTP / 下载 / 解压实现
  │   ├── storage/            # JSON 持久化存储
+ │   ├── database/           # SQLite / MySQL 封装（bot.sql）
  │   ├── config/             # .env 加载
  │   ├── docserver/          # 内嵌 Wiki（docs/** 由 go:embed 打包）
  │   ├── command/            # 控制台指令（help / reload / exit）
@@ -168,8 +184,7 @@ db.set("game/" .. event.user_id, data)
  │   └── demo/
  │       ├── init.lua        # 目录插件入口
  │       ├── utils.lua       # 工具模块
- │       ├── storage.lua     # 签到示例
- │       └── sub/pic.lua     # 发图示例
+ │       └── storage.lua     # 签到示例
  └── release/                # 编译产物与运行时配置（不纳入版本控制）
 ```
 
@@ -181,7 +196,7 @@ db.set("game/" .. event.user_id, data)
 | 事件分发 | 18 个 `on_*` 处理函数，含 `on_notice` / `on_request` 泛型回退 |
 | 消息段 | text / image / record / video / at / reply / forward / node / 自定义 |
 | Lua `bot` API | 45 个成员 |
-| `util` 工具集 | 37 个函数 + `MemFS` |
+| `util` 工具集 | 39 个函数 + `MemFS` |
 | 内嵌 Wiki | `internal/docserver/docs/` 下的 Markdown 自动渲染 |
 
 ### 注意事项

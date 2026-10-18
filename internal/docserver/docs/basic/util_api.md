@@ -631,6 +631,55 @@ local result, err = util.extract_archive("data/downloads/file.tar.gz", "data/ext
 
 内置路径穿越防护，自动拒绝写入目标目录外的文件。
 
+> ⚠️ `extract_archive` 是**同步**调用，解压期间会占用事件循环。
+> 压缩包较大时请改用 `extract_async` + `extract_poll`。
+
+### util.extract_async
+
+异步解压，立即返回任务 ID，适合大压缩包。
+
+```lua
+local task_id = util.extract_async(file, dest_dir)
+```
+
+| 返回 | 类型 | 说明 |
+|------|------|------|
+| 成功 | string | 任务 ID，用于 `extract_poll()` 查询 |
+
+```lua
+local id = util.extract_async("data/downloads/big.zip", "data/out")
+local function wait()
+    local st = util.extract_poll(id)
+    if not st or not st.done then
+        return util.After(1, wait)
+    end
+    if st.error then
+        util.Log("ERROR", "解压失败: " .. st.error)
+        return
+    end
+    util.Log("INFO", "解压完成，共 " .. st.count .. " 个条目")
+end
+wait()
+```
+
+### util.extract_poll
+
+查询异步解压进度。任务不存在返回 `nil`。
+
+```lua
+local st = util.extract_poll(task_id)
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `st.id` | string | 任务 ID |
+| `st.file` | string | 源文件 |
+| `st.dest` | string | 目标目录 |
+| `st.done` | bool | 是否完成 |
+| `st.count` | number | 已解压条目数 |
+| `st.elapsed` | number | 已耗时（秒） |
+| `st.error` | string | 失败时的错误信息（可选） |
+
 ---
 
 ## 内存存储

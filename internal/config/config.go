@@ -18,6 +18,8 @@ type Config struct {
 	WSPath       string
 	FileUnsafe   bool
 	HTTPInsecure bool
+	SQLDriver    string
+	SQLDSN       string
 }
 
 func Load() *Config {
@@ -31,6 +33,8 @@ func Load() *Config {
 		WSPath:       getEnv("ONEBOT_WS_PATH", "/"),
 		FileUnsafe:   getEnvBool("ONEBOT_FILE_UNSAFE"),
 		HTTPInsecure: getEnvBool("ONEBOT_HTTP_INSECURE"),
+		SQLDriver:    getEnv("ONEBOT_SQL_DRIVER", ""),
+		SQLDSN:       getEnv("ONEBOT_SQL_DSN", ""),
 	}
 	cfg.WSURL = getEnv("ONEBOT_WS_URL", cfg.BaseURL)
 

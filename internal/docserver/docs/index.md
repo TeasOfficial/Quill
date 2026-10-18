@@ -21,6 +21,7 @@ ONEBOT_WS_MODE=forward
 | `util` | JSON / Base64 / 哈希 / AES / UUID / URL 编码 / 定时器 |
 | `util.xxx()` | 内置工具集（HTTP 请求、多线程下载、解压等） |
 | `bot.db` | 键值持久化存储 |
+| `bot.sql` | SQLite / MySQL（配置 `ONEBOT_SQL_DRIVER` 后启用） |
 | `bot.file` | 文件读写（沙箱内） |
 | Wiki | :3081 内嵌文档 |
 
@@ -41,6 +42,7 @@ internal/
     onebot/             OneBot v11 HTTP + WebSocket
     plugin/             gopher-lua 插件引擎 + util 工具集
     storage/            JSON 键值持久化
+    database/           SQLite / MySQL 封装（bot.sql）
     config/             .env 配置加载
     docserver/          内嵌 Wiki 文档服务
     logc/               彩色终端日志

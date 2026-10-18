@@ -152,7 +152,9 @@ bot.send_group_msg(event.group_id, "返回 " .. resp)
 | `util.download_file(url, path, threads?)` | 异步多线程下载，返回任务 ID |
 | `util.download_poll(task_id)` | 查询下载任务进度 |
 | `util.download_list()` | 列出所有下载任务 |
-| `util.extract_archive(file, dest)` | 解压 (zip/tar/gz/bz2)，含路径穿越防护 |
+| `util.extract_archive(file, dest)` | 解压 (zip/tar/gz/bz2)，同步，含路径穿越防护 |
+| `util.extract_async(file, dest)` | 异步解压，返回任务 ID（大压缩包用这个） |
+| `util.extract_poll(task_id)` | 查询解压进度 |
 
 > ⚠️ `AESEncrypt` / `AESDecrypt` 的 key **不应硬编码在插件源码中**。建议用 `util.GetEnv("MY_KEY")` 从 `.env` 读取。
 

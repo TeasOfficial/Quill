@@ -1,12 +1,17 @@
 package module
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	lua "github.com/yuin/gopher-lua"
 )
 
 func TestMarkDoneKeepsKnownTotal(t *testing.T) {
@@ -78,5 +83,76 @@ func TestHTTPRequestHonorsContext(t *testing.T) {
 func TestDefaultHTTPTimeoutIsSane(t *testing.T) {
 	if defaultHTTPTimeout > 2*time.Minute {
 		t.Fatalf("defaultHTTPTimeout = %v, want <= 2m", defaultHTTPTimeout)
+	}
+}
+
+func createTestZip(t *testing.T, path, name, content string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zw := zip.NewWriter(f)
+	w, err := zw.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExtractAsyncAndPoll(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "a.zip")
+	dest := filepath.Join(dir, "out")
+	createTestZip(t, zipPath, "hello.txt", "hi")
+
+	L := lua.NewState()
+	defer L.Close()
+	utilTbl := L.NewTable()
+	RegisterModuleUtil(L, utilTbl)
+	L.SetGlobal("util", utilTbl)
+
+	L.Push(utilTbl.RawGetString("extract_async"))
+	L.Push(lua.LString(zipPath))
+	L.Push(lua.LString(dest))
+	if err := L.PCall(2, 1, nil); err != nil {
+		t.Fatalf("extract_async: %v", err)
+	}
+	id := L.Get(-1).String()
+	L.Pop(1)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		L.Push(utilTbl.RawGetString("extract_poll"))
+		L.Push(lua.LString(id))
+		if err := L.PCall(1, 1, nil); err != nil {
+			t.Fatalf("extract_poll: %v", err)
+		}
+		st, ok := L.Get(-1).(*lua.LTable)
+		L.Pop(1)
+		if !ok {
+			t.Fatal("extract_poll should return a table")
+		}
+		if st.RawGetString("done") == lua.LTrue {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("extract task did not finish in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	b, err := os.ReadFile(filepath.Join(dest, "hello.txt"))
+	if err != nil {
+		t.Fatalf("read extracted file: %v", err)
+	}
+	if string(b) != "hi" {
+		t.Fatalf("content = %q", string(b))
 	}
 }

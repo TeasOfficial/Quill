@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"quill/internal/command"
 	"quill/internal/config"
+	"quill/internal/database"
 	"quill/internal/docserver"
 	"quill/internal/logc"
 	"quill/internal/module"
@@ -42,7 +44,27 @@ func main() {
 	}
 
 	mgr := plugin.NewManager(client, db, cfg.FileUnsafe)
-	defer mgr.Close()
+
+	var sqlDB *database.DB
+	defer func() {
+		mgr.Close()
+		if sqlDB != nil {
+			_ = sqlDB.Close()
+		}
+	}()
+
+	if strings.TrimSpace(cfg.SQLDriver) != "" {
+		opened, err := database.Open(cfg.SQLDriver, cfg.SQLDSN)
+		if err != nil {
+			logc.Fmt("!", logc.Red, "SQL \u521d\u59cb\u5316\u5931\u8d25: %v", err)
+		} else {
+			sqlDB = opened
+			mgr.AttachSQL(sqlDB)
+			logc.Fmt("\u2713", logc.Green, "SQL \u5df2\u8fde\u63a5: %s", sqlDB.Driver)
+		}
+	} else {
+		logc.Fmt("\u00b7", logc.Gray, "SQL \u672a\u542f\u7528\uff08\u8bbe\u7f6e ONEBOT_SQL_DRIVER=sqlite|mysql\uff09")
+	}
 
 	if err := mgr.LoadPlugins("plugins"); err != nil {
 		logc.Fmt("!", logc.Yellow, "\u63d2\u4ef6\u52a0\u8f7d\u8b66\u544a: %v", err)
@@ -53,7 +75,7 @@ func main() {
 	receiver := onebot.NewReceiver()
 	receiver.OnEvent = func(e *onebot.Event) {
 		if e.PostType == "meta_event" {
-			mgr.Dispatch(e)
+			mgr.Enqueue(e)
 			return
 		}
 		switch {
@@ -68,7 +90,7 @@ func main() {
 		default:
 			logc.Fmt("\u25CB", logc.Gray, "%s", e.PostType)
 		}
-		mgr.Dispatch(e)
+		mgr.Enqueue(e)
 	}
 	receiver.OnConnect = func() {
 		logc.Fmt("\u2713", logc.Green, "\u5df2\u8fde\u63a5 OneBot")

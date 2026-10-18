@@ -19,9 +19,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"quill/internal/database"
 	"quill/internal/logc"
 	"quill/internal/module"
 	"quill/internal/onebot"
@@ -35,6 +37,7 @@ type Manager struct {
 	L          *lua.LState
 	client     *onebot.Client
 	registry   *lua.LTable
+	botTbl     *lua.LTable
 	db         *storage.DB
 	fileUnsafe bool
 	timers     []timerEntry
@@ -47,11 +50,24 @@ type Manager struct {
 	startOnce  sync.Once
 	closeOnce  sync.Once
 	closed     bool
+
+	// 事件队列：接收协程只入队，绝不因插件执行而阻塞。
+	eventCh  chan *onebot.Event
+	dropped  atomic.Int64
+	lastDrop atomic.Int64
+
+	// 记录当前正在执行的 Lua 调用，便于 Close 时立即取消。
+	activeMu     sync.Mutex
+	activeCancel context.CancelFunc
+	closing      bool
 }
 
-// pluginTimeout 是单次事件分发与定时器回调的执行上限。
-// 超时后 gopher-lua 会中断 Lua 代码，避免一个插件卡死整个 bot。
-const pluginTimeout = 5 * time.Second
+const (
+	// pluginTimeout 是单次事件分发与单个定时器回调的总执行上限。
+	pluginTimeout = 5 * time.Second
+	// eventQueueSize 是事件队列长度；满队列时丢弃新事件而不是阻塞读取。
+	eventQueueSize = 256
+)
 
 type logEntry struct {
 	level string
@@ -80,17 +96,45 @@ func NewManager(client *onebot.Client, db *storage.DB, fileUnsafe bool) *Manager
 		logDone:    make(chan struct{}),
 		memFS:      make(map[string][]byte),
 		done:       make(chan struct{}),
+		eventCh:    make(chan *onebot.Event, eventQueueSize),
 	}
 	go m.logWriter()
 	m.registerBotAPI()
 	return m
 }
 
-// Start 启动后台定时器循环。未调用时 util.After 注册的定时器不会自动执行。
+// Enqueue 把事件放入队列后立即返回，接收协程不会被插件执行阻塞。
+// 队列满时丢弃并限频告警（宁可丢事件，也不让读取协程卡住）。
+func (m *Manager) Enqueue(ev *onebot.Event) {
+	select {
+	case m.eventCh <- ev:
+	default:
+		n := m.dropped.Add(1)
+		now := time.Now().UnixNano()
+		last := m.lastDrop.Load()
+		if now-last > int64(3*time.Second) && m.lastDrop.CompareAndSwap(last, now) {
+			logc.Fmt("!", logc.Yellow, "[队列] 事件积压，已累计丢弃 %d 条", n)
+		}
+	}
+}
+
+// Start 启动定时器与事件分发协程。
 func (m *Manager) Start() {
 	m.startOnce.Do(func() {
 		go m.timerLoop()
+		go m.dispatchLoop()
 	})
+}
+
+func (m *Manager) dispatchLoop() {
+	for {
+		select {
+		case <-m.done:
+			return
+		case ev := <-m.eventCh:
+			m.Dispatch(ev)
+		}
+	}
 }
 
 func (m *Manager) timerLoop() {
@@ -101,18 +145,31 @@ func (m *Manager) timerLoop() {
 		case <-m.done:
 			return
 		case <-ticker.C:
-			m.mu.Lock()
-			if !m.closed {
-				m.processTimersLocked()
-			}
-			m.mu.Unlock()
+			m.runDueTimers()
 		}
 	}
+}
+
+// runDueTimers 必须保证无论如何都会释放 m.mu，
+// 否则一次 panic 就会把整个 bot 永久锁死。
+func (m *Manager) runDueTimers() {
+	defer func() {
+		if r := recover(); r != nil {
+			logc.Fmt("!", logc.Red, "[定时器] 循环异常，已恢复: %v", r)
+		}
+	}()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	m.processTimersLocked()
 }
 
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {
 		close(m.done)
+		m.beginClosing()
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		m.closed = true
@@ -120,6 +177,33 @@ func (m *Manager) Close() {
 		<-m.logDone
 		m.L.Close()
 	})
+}
+
+// beginClosing 会取消正在执行的 Lua 调用，避免关闭时无限等待。
+func (m *Manager) beginClosing() {
+	m.activeMu.Lock()
+	m.closing = true
+	if m.activeCancel != nil {
+		m.activeCancel()
+	}
+	m.activeMu.Unlock()
+}
+
+func (m *Manager) setActiveCancel(cancel context.CancelFunc) {
+	m.activeMu.Lock()
+	if m.closing {
+		m.activeMu.Unlock()
+		cancel()
+		return
+	}
+	m.activeCancel = cancel
+	m.activeMu.Unlock()
+}
+
+func (m *Manager) clearActiveCancel() {
+	m.activeMu.Lock()
+	m.activeCancel = nil
+	m.activeMu.Unlock()
 }
 
 func (m *Manager) logWriter() {
@@ -136,6 +220,7 @@ func (m *Manager) logWriter() {
 func (m *Manager) registerBotAPI() {
 	L := m.L
 	bot := L.NewTable()
+	m.botTbl = bot
 
 	L.SetField(bot, "send_group_msg", L.NewFunction(func(L *lua.LState) int {
 		groupID := L.CheckInt64(1)
@@ -832,7 +917,7 @@ func (m *Manager) registerBotAPI() {
 	}))
 	L.SetField(util, "DNSResolveALL", L.NewFunction(func(L *lua.LState) int {
 		domain := L.CheckString(1)
-		addrs, err := net.LookupHost(domain)
+		addrs, err := net.DefaultResolver.LookupHost(luaCtx(L), domain)
 		if err != nil {
 			L.Push(lua.LNil)
 			L.Push(lua.LString(err.Error()))
@@ -858,7 +943,7 @@ func (m *Manager) registerBotAPI() {
 	}))
 	L.SetField(util, "DNSResolve", L.NewFunction(func(L *lua.LState) int {
 		domain := L.CheckString(1)
-		addrs, err := net.LookupHost(domain)
+		addrs, err := net.DefaultResolver.LookupHost(luaCtx(L), domain)
 		if err != nil {
 			L.Push(lua.LNil)
 			L.Push(lua.LString(err.Error()))
@@ -1156,6 +1241,14 @@ func (m *Manager) registerBotAPI() {
 	L.SetGlobal("bot", bot)
 }
 
+// AttachSQL 把 bot.sql 注册到已创建的 bot 表，必须在加载插件之前调用。
+func (m *Manager) AttachSQL(db *database.DB) {
+	if db == nil || m.botTbl == nil {
+		return
+	}
+	database.Attach(m.L, m.botTbl, db)
+}
+
 func safeDataPath(rel string) (string, error) {
 	return resolveSafe(rel, "data")
 }
@@ -1348,12 +1441,6 @@ func (m *Manager) LoadPlugins(dir string) error {
 	return m.doLoadPlugins(dir)
 }
 
-func (m *Manager) UnloadPlugins() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.doUnloadPlugins()
-}
-
 func (m *Manager) doUnloadPlugins() {
 	m.registry = m.L.NewTable()
 	m.L.SetGlobal("__plugin_registry", m.registry)
@@ -1522,8 +1609,6 @@ func (m *Manager) doPluginFile(baseDir, path string) error {
 	}
 
 	pAuthor := stringOf(infoTbl.RawGetString("author"))
-	pUpdate := stringOf(infoTbl.RawGetString("update_url"))
-	_ = pUpdate
 
 	displayName := pName
 	if pVer != "" {
@@ -1554,13 +1639,23 @@ func stringOf(v lua.LValue) string {
 	return v.String()
 }
 
-// callLua 在独立的超时上下文中执行一个 Lua 函数。
-// 超时/panic 都会转换成 error，不会影响后续事件。
-func (m *Manager) callLua(fn lua.LValue, args ...lua.LValue) (err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), pluginTimeout)
+// callLua 在超时上下文中执行一个 Lua 函数。
+// 超时 / panic / 关闭都会转换成 error，不会影响后续事件。
+func (m *Manager) callLua(ctx context.Context, fn lua.LValue, args ...lua.LValue) (err error) {
+	callCtx, cancel := context.WithTimeout(ctx, pluginTimeout)
 	defer cancel()
 
-	m.L.SetContext(ctx)
+	m.setActiveCancel(cancel)
+	defer m.clearActiveCancel()
+
+	// 让 bot.* 的 HTTP 调用也能被同一个 5 秒预算取消。
+	// Lua 执行由 m.mu 串行化，因此这里对 Client 的写入不存在并发。
+	if m.client != nil {
+		m.client.SetContext(callCtx)
+		defer m.client.ClearContext()
+	}
+
+	m.L.SetContext(callCtx)
 	defer m.L.RemoveContext()
 	defer func() {
 		if r := recover(); r != nil {
@@ -1578,11 +1673,21 @@ func (m *Manager) callLua(fn lua.LValue, args ...lua.LValue) (err error) {
 func (m *Manager) Dispatch(event *onebot.Event) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+
+	// 整个事件共享一个 5 秒预算，避免 N 个插件各占 5 秒。
+	ctx, cancel := context.WithTimeout(context.Background(), pluginTimeout)
+	defer cancel()
 
 	eventTbl := eventToTable(m.L, event)
 	handlerKey, fallbackKey := routeEvent(event)
 
 	m.registry.ForEach(func(name, plugin lua.LValue) {
+		if ctx.Err() != nil {
+			return
+		}
 		tbl, ok := plugin.(*lua.LTable)
 		if !ok {
 			return
@@ -1595,10 +1700,14 @@ func (m *Manager) Dispatch(event *onebot.Event) {
 			return
 		}
 
-		if err := m.callLua(handler, eventTbl); err != nil {
+		if err := m.callLua(ctx, handler, eventTbl); err != nil {
 			logc.Fmt("!", logc.Red, "[%s] %s 错误: %v", name, handlerKey, err)
 		}
 	})
+
+	if ctx.Err() != nil {
+		logc.Fmt("!", logc.Yellow, "[事件] %s 处理超时，已跳过剩余插件", event.PostType)
+	}
 }
 
 // processTimersLocked 执行到期的定时器。调用方必须持有 m.mu。
@@ -1621,7 +1730,10 @@ func (m *Manager) processTimersLocked() {
 	m.timers = keep
 
 	for _, t := range due {
-		if err := m.callLua(t.fn); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), pluginTimeout)
+		err := m.callLua(ctx, t.fn)
+		cancel()
+		if err != nil {
 			logc.Fmt("!", logc.Red, "[定时器] 执行错误: %v", err)
 		}
 	}
@@ -1720,32 +1832,6 @@ func eventToTable(L *lua.LState, e *onebot.Event) *lua.LTable {
 	tbl.RawSetString("sender", sender)
 
 	return tbl
-}
-
-func luaToGo(v lua.LValue) interface{} {
-	switch val := v.(type) {
-	case lua.LString:
-		return string(val)
-	case lua.LNumber:
-		return float64(val)
-	case lua.LBool:
-		return bool(val)
-	case *lua.LTable:
-		if val.Len() > 0 {
-			arr := make([]interface{}, 0)
-			val.ForEach(func(_, elem lua.LValue) {
-				arr = append(arr, luaToGo(elem))
-			})
-			return arr
-		}
-		obj := make(map[string]interface{})
-		val.ForEach(func(k, elem lua.LValue) {
-			obj[k.String()] = luaToGo(elem)
-		})
-		return obj
-	default:
-		return v.String()
-	}
 }
 
 func jsonToLua(L *lua.LState, v interface{}) lua.LValue {
@@ -1892,4 +1978,12 @@ func pkcs7Unpad(data []byte) []byte {
 		return nil
 	}
 	return data[:len(data)-pad]
+}
+
+// luaCtx 返回当前 Lua 调用携带的上下文；没有时退化为 Background。
+func luaCtx(L *lua.LState) context.Context {
+	if ctx := L.Context(); ctx != nil {
+		return ctx
+	}
+	return context.Background()
 }

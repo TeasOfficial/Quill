@@ -101,7 +101,7 @@ var sectionDefs = []struct {
 	Title string
 	Order []string
 }{
-	{"basic", "普通版", []string{"quickstart", "plugin", "message", "storage", "bot_api", "util_api"}},
+	{"basic", "普通版", []string{"quickstart", "plugin", "message", "storage", "sql", "bot_api", "util_api"}},
 	{"pro", "专业版", []string{"overview", "onebot", "message", "plugin", "storage"}},
 }
 

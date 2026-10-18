@@ -2,6 +2,7 @@ package onebot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +15,17 @@ type Client struct {
 	BaseURL    string
 	Token      string
 	HTTPClient *http.Client
+
+	// ctx 仅由 Manager 在持有 Lua 锁时设置，用于给 bot.* 调用加上
+	// 与插件执行相同的超时预算。Client 不应被并发调用。
+	ctx context.Context
 }
+
+// SetContext 设置后续请求使用的上下文。
+func (c *Client) SetContext(ctx context.Context) { c.ctx = ctx }
+
+// ClearContext 清除上下文，恢复默认行为。
+func (c *Client) ClearContext() { c.ctx = nil }
 
 func NewClient(baseURL, token string) *Client {
 	return &Client{
@@ -33,7 +44,12 @@ func (c *Client) apiCall(action string, params interface{}) (*APIResponse, error
 		return nil, fmt.Errorf("marshal params: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

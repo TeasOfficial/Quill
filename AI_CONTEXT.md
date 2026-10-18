@@ -91,7 +91,7 @@ Lua API 统一约定（遵循 Lua 的 nil+err 惯例）：
 
 ### bot API
 
-`bot` 是全局表，共 45 个成员。
+`bot` 是全局表，共 46 个成员（含可选的 `bot.sql`）。
 
 #### 消息发送
 
@@ -197,7 +197,7 @@ event.file = {id, name, size, busid}        -- 仅 upload / offline_file 事件
 
 ### util 工具集
 
-全局可用，无需引入。共 37 个函数 + `MemFS`。
+全局可用，无需引入。共 39 个函数 + `MemFS`。
 
 ```
 JSONToTable(str)           → table        TableToJSON(tbl)            → string
@@ -253,7 +253,12 @@ local st  = util.download_poll(id)     -- 任务不存在返回 nil
 local all = util.download_list()       -- 数组表，列出近期任务
 
 -- 解压：成功返回 JSON 字符串 {"ok":true,"dest":...,"count":n}，失败返回 nil, err
+-- 同步版本会占用事件循环，仅适合小压缩包
 local ok, err = util.extract_archive("downloads/big.zip", "downloads/out")
+
+-- 大压缩包用异步版本（不占用事件循环）
+local ex = util.extract_async("downloads/big.zip", "downloads/out")
+local st = util.extract_poll(ex)       -- { id, file, dest, done, count, elapsed, error? }
 ```
 
 支持的压缩格式：`.zip`、`.tar`、`.tar.gz`/`.tgz`、`.tar.bz2`/`.tbz2`、`.gz`、`.bz2`。
@@ -274,6 +279,33 @@ bot.db.set("signin/" .. event.user_id, data)
 ```
 
 key 中 `..` 会被拒绝；key 可包含 `/` 以生成子目录。
+
+### SQL（可选）
+
+配置 `ONEBOT_SQL_DRIVER=sqlite|mysql` 后，`bot.sql` 可用；未配置时该字段不存在。
+
+```lua
+-- exec -> 受影响行数, 自增 ID
+local n, id = bot.sql.exec("INSERT INTO points (qq, score) VALUES (?, ?)", {event.user_id, 10})
+
+-- query -> 数组表（每行一个 table）
+local rows = bot.sql.query("SELECT qq, score FROM points ORDER BY score DESC LIMIT ?", {10})
+
+-- query_row -> 第一行或 nil
+local row = bot.sql.query_row("SELECT score FROM points WHERE qq = ?", {event.user_id})
+local score = row and row.score or 0
+
+-- 事务：正常结束提交，抛错回滚
+local ok, err = bot.sql.tx(function(tx)
+    tx.exec("UPDATE points SET score = score + ? WHERE qq = ?", {1, event.user_id})
+end)
+```
+
+- 参数用 `?` 占位，驱动会做类型转换（整数、浮点、字符串、布尔）
+- **Lua 数组里的 nil 会截断长度**，SQL NULL 请用 `bot.sql.NULL`：`{1, bot.sql.NULL, 3}`
+- 查询结果里的 NULL 是 Lua `nil`
+- SQL 在 5 秒事件预算内执行，慢查询会被中断
+- SQLite 默认 `data/bot.db`，开启 WAL；MySQL 需要提供 `ONEBOT_SQL_DSN`
 
 ### 文件 I/O
 
@@ -363,15 +395,16 @@ if not resp.ok then
 end
 ```
 
-### 超时
+### 超时与阻塞
 
-每个事件 handler 与每个定时器回调都有 **5 秒**执行上限；超时后 gopher-lua 会中断该段 Lua 代码，
-记录一条错误日志，然后继续处理后续事件。
+每个事件 handler 与每个定时器回调共享一个 **5 秒**执行预算；超时后 gopher-lua 会中断该段 Lua 代码，
+记录错误日志并跳过该事件剩余的插件，然后继续处理后续事件。
 
-`util.http_get` / `http_post` 默认超时 60 秒，`util.Sleep` 会被超时打断。
-由于外层 5 秒上限，同步 HTTP 实际最多占用约 5 秒；需要更久的任务请用 `util.download_file`（异步）。
+`util.http_get` / `http_post` 默认超时 60 秒，`util.Sleep` 会被超时打断，`bot.*` 的 HTTP 调用也
+跟随同一个预算取消。需要更久的任务请用 `util.download_file` / `util.extract_async`（异步）。
 
-> 事件分发仍是串行的：同一时间只有一个 handler 在执行，其他事件排队。
+事件通过队列进入分发协程（上限 256），插件执行**不会阻塞 WebSocket 读取**；
+队列持续溢出时会丢弃新事件并限频告警。
 
 ---
 
@@ -392,9 +425,10 @@ end
 
 | 现象 | 说明 |
 |------|------|
-| 事件分发串行 | 一个插件执行期间其他事件排队等待 |
+| 事件分发串行 | 同一时间一个 handler 执行，其他事件在队列中排队（上限 256） |
 | 定时器精度 | 后台循环每 200ms 检查一次，触发时间有 0~200ms 偏差 |
 | 插件无沙箱 | 等同本机代码，只安装可信插件 |
+| 同步解压会阻塞 | `extract_archive` 执行期间事件循环停摆，大包请用 `extract_async` |
 
 ---
 

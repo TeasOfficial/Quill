@@ -2,7 +2,7 @@
 -- mapdl.lua — CS:S BHop 地图下载 / 删除插件
 -- /mapdl <地图名>  下载并安装地图
 -- /mapdel <地图名>  删除已安装地图
--- 使用内置 util.download_file + util.extract_archive
+-- 使用内置 util.download_file + util.extract_async
 -- ============================================================
 
 -- 本机路径通过 .env 配置，不要把目录写进仓库。
@@ -13,10 +13,6 @@ local FASTDL_BASE = util.GetEnv("MAPDL_FASTDL_BASE") or "https://main.fastdl.me/
 local MAPS_DIR    = util.GetEnv("MAPDL_MAPS_DIR") or ""
 local TEMP_DIR    = util.GetEnv("MAPDL_TEMP_DIR") or "mapdl_temp"
 local CONFIGURED  = MAPS_DIR ~= ""
-
--- ============================================================
--- 内置模块 (util.download_file / util.extract_archive)
--- ============================================================
 
 -- ============================================================
 -- PluginInfo (Quill 新版必须)
@@ -32,17 +28,6 @@ Quill.PluginInfo = {
 -- ============================================================
 -- 工具函数
 -- ============================================================
-
---- 格式化字节数为人类可读字符串
-local function fmt_size(bytes)
-    if bytes >= 1048576 then
-        return string.format("%.1f MB", bytes / 1048576)
-    elseif bytes >= 1024 then
-        return string.format("%d KB", math.floor(bytes / 1024))
-    else
-        return bytes .. " B"
-    end
-end
 
 --- 向触发消息的群发送 AT + 文本回复
 local function reply(event, text)
@@ -182,14 +167,6 @@ function Quill.on_group_message(event)
     -- ==========================================
     local task_id = util.download_file(url, bz2_path, 8)
 
-    local ctx = {
-        event     = event,
-        map_name  = map_name,
-        bz2_path  = bz2_path,
-        dest_path = dest_path,
-        MAPS_DIR  = MAPS_DIR,
-    }
-
     local function pollDownload()
         local status = util.download_poll(task_id)
         if not util.IsValid(status) then
@@ -209,14 +186,11 @@ function Quill.on_group_message(event)
             util.Log("INFO", string.format("QQ:%d 下载 %s — 下载完成，开始解压",
                 event.user_id, map_name))
 
-            local ok, err = pcall(function()
-                local ex_resp_str, ex_err = util.extract_archive(bz2_path, MAPS_DIR)
-                if ex_err then error(ex_err) end
-                local ex_result = util.JSONToTable(ex_resp_str)
-                if not ex_result or not ex_result.ok then error("解压失败") end
+            -- 异步解压：不占用 Lua 事件循环，大压缩包也不会卡住其他事件
+            local ex_id = util.extract_async(bz2_path, MAPS_DIR)
 
+            local function finish()
                 os.remove(bz2_path)
-
                 local f = io.open(dest_path, "r")
                 if f then
                     local kb = math.floor(f:seek("end") / 1024)
@@ -229,13 +203,30 @@ function Quill.on_group_message(event)
                     util.Log("ERROR", string.format("QQ:%d 下载 %s — 安装验证失败",
                         event.user_id, map_name))
                 end
-            end)
-            if not ok then
-                reply(event, " ❌ " .. map_name .. " 处理失败: " .. tostring(err))
-                util.Log("ERROR", string.format("QQ:%d 下载 %s — 处理失败: %s",
-                    event.user_id, map_name, tostring(err)))
-                os.remove(bz2_path)
             end
+
+            local function pollExtract()
+                local st = util.extract_poll(ex_id)
+                if not st then
+                    reply(event, " ❌ " .. map_name .. " 解压任务丢失")
+                    os.remove(bz2_path)
+                    return
+                end
+                if not st.done then
+                    util.After(1, pollExtract)
+                    return
+                end
+                if st.error then
+                    reply(event, " ❌ " .. map_name .. " 解压失败: " .. st.error)
+                    util.Log("ERROR", string.format("QQ:%d 下载 %s — 解压失败: %s",
+                        event.user_id, map_name, st.error))
+                    os.remove(bz2_path)
+                    return
+                end
+                finish()
+            end
+
+            pollExtract()
         else
             util.After(2, pollDownload)
         end

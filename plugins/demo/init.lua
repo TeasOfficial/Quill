@@ -7,7 +7,6 @@ Quill.PluginInfo = {
 }
 
 local utils = include("utils")
-include("sub/pic")
 local store = include("storage")
 
 local config = {
@@ -29,7 +28,6 @@ Quill.on_group_message = function(event)
             bot.text("\n我的积分    -- 查看积分"),
             bot.text("\n/demo time  -- 查看时间"),
             bot.text("\n/demo http  -- 测试内置 HTTP 工具"),
-            bot.text("\n/demo pic   -- 发张图"),
             bot.text("\n/demo file  -- 测试文件读写"),
         })
         return
